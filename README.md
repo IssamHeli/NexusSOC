@@ -130,28 +130,57 @@ Grafana default login: `admin` / your `DB_PASS` from `.env`
 ## Project Structure
 
 ```
-SocAnalyst_Ai_Agent/
-├── docker-compose.yml         # Wires all services together
-├── .env                       # Your credentials (gitignored — never commit)
-├── .env.example               # Template — copy to .env and fill in
-├── ai_agent_src/              # AI agent backend (FastAPI)
-│   ├── main.py
-│   ├── correlator.py
-│   ├── playbooks.py
-│   ├── seed_playbooks.py
-│   ├── worker.py
-│   ├── advanced_soc_simulation.py
+NexusSOC/
+├── docker-compose.yml              # Wires all services together
+├── .env                            # Your credentials (gitignored — never commit)
+├── .gitignore
+│
+├── ai_agent_src/                   # AI agent backend (FastAPI)
+│   ├── main.py                     # API routes, alert intake, analysis pipeline
+│   ├── correlator.py               # Incident correlation & kill chain tracking
+│   ├── playbooks.py                # Playbook engine (block IP, quarantine, notify)
+│   ├── worker.py                   # Background queue worker (Redis)
+│   ├── advanced_soc_simulation.py  # Built-in simulation harness
+│   ├── seed_playbooks.py           # Seeds default playbooks on first run
+│   ├── requirements.txt
+│   ├── .env.example                # Template — copy to .env and fill in
 │   ├── Dockerfile
-│   └── README.md              # Full API reference
+│   └── README.md                   # Full API reference & configuration
+│
 ├── grafana/
-│   └── dashboards/            # Pre-built Grafana dashboard JSON files
-│       ├── soc-overview.json
-│       ├── incidents-killchain.json
-│       └── skills-playbooks.json
-└── soc-frontend/              # React dashboard
+│   └── dashboards/                 # Pre-built Grafana dashboard JSON files
+│       ├── soc-overview.json       # Alert volume, TP/FP ratio, confidence trends
+│       ├── incidents-killchain.json# Open incidents, severity, kill chain phases
+│       └── skills-playbooks.json   # Skill confidence, playbook execution counts
+│
+└── soc-frontend/                   # React dashboard (Vite + TypeScript)
+    ├── index.html
+    ├── vite.config.ts
+    ├── tsconfig.json
+    ├── package.json
+    ├── Dockerfile
+    ├── nginx.conf                  # Production nginx config (used in Docker)
+    ├── public/
+    │   ├── favicon.svg
+    │   └── icons.svg
     └── src/
-        ├── components/        # Dashboard, KillChainTimeline, SkillsPanel...
-        └── lib/               # API client
+        ├── main.tsx
+        ├── App.tsx
+        ├── types.ts                # Shared TypeScript interfaces
+        ├── components/
+        │   ├── Dashboard.tsx       # Main layout & tab routing
+        │   ├── StatusBar.tsx       # Agent health, TP/FP rate, memory count
+        │   ├── KillChainTimeline.tsx
+        │   ├── MemoryPanel.tsx     # Past cases + analyst feedback
+        │   ├── SkillsPanel.tsx     # Learned detection patterns
+        │   ├── PlaybooksPanel.tsx  # Playbook management & history
+        │   └── SimulationRunner.tsx
+        ├── data/
+        │   └── alerts.ts           # Sample alert payloads for simulation
+        ├── lib/
+        │   └── api.ts              # API client (all backend calls)
+        └── styles/
+            └── global.css
 ```
 
 ## Security Notes
