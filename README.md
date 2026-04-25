@@ -5,36 +5,80 @@ A fully local, autonomous SOC platform that triages security alerts with a local
 ## Platform Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        NexusSOC Stack                           │
-│                                                                 │
-│  SIEM / EDR / TheHive                                           │
-│         │                                                       │
-│         ▼                                                       │
-│  ┌─────────────────┐     ┌──────────┐     ┌─────────────────┐  │
-│  │  AI Agent API   │────►│  Redis   │────►│     Worker      │  │
-│  │  (FastAPI)      │     │  Queue   │     │  (background)   │  │
-│  └────────┬────────┘     └──────────┘     └─────────────────┘  │
-│           │                                                     │
-│           ▼                                                     │
-│  ┌─────────────────┐     ┌──────────────────────────────────┐  │
-│  │  Ollama (local) │     │  PostgreSQL + pgvector           │  │
-│  │  LLM + Embeddings     │  Memory · Skills · Incidents     │  │
-│  └─────────────────┘     └──────────────────────────────────┘  │
-│           │                                                     │
-│           ▼                                                     │
-│  ┌─────────────────┐     ┌──────────────────────────────────┐  │
-│  │  SOC Frontend   │     │  Grafana Dashboards              │  │
-│  │  (React)        │     │  Overview · Kill Chain · Skills  │  │
-│  └─────────────────┘     └──────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         Real SOC Tool Stack                              │
+│                                                                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐                │
+│  │  Wazuh   │  │ Suricata │  │  Arkime  │  │   Zeek   │                │
+│  │  (SIEM)  │  │  (IDS)   │  │ (Packet) │  │(Network) │                │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘                │
+│       └─────────────┴─────────────┴──────────────┘                      │
+│                              │ alerts                                    │
+│                              ▼                                           │
+│                    ┌──────────────────┐                                  │
+│                    │  Shuffle  SOAR   │  orchestration & automation      │
+│                    └────────┬─────────┘                                  │
+│            ┌───────────────┬┴────────────────┐                           │
+│            ▼               ▼                 ▼                           │
+│     ┌────────────┐  ┌────────────┐   ┌─────────────┐                    │
+│     │    MISP    │  │   Cortex   │   │  OpenCTI    │                    │
+│     │(Threat     │  │ VT+AbuseIP │   │(GraphQL CTI)│                    │
+│     │  Intel)    │  │    DB      │   │             │                    │
+│     └────────────┘  └────────────┘   └─────────────┘                    │
+│            └───────────────┬─────────────────┘                           │
+│                            ▼                                             │
+│                    ┌──────────────────┐                                  │
+│                    │    TheHive       │  case management                 │
+│                    └────────┬─────────┘                                  │
+│                             │ enriched case                              │
+│                             ▼                                            │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                       NexusSOC                                    │   │
+│  │                                                                   │   │
+│  │  ┌─────────────────┐   ┌──────────┐   ┌──────────────────────┐  │   │
+│  │  │  AI Agent API   │──►│  Redis   │──►│  Background Worker   │  │   │
+│  │  │  (FastAPI:8001) │   │  Queue   │   │                      │  │   │
+│  │  └────────┬────────┘   └──────────┘   └──────────────────────┘  │   │
+│  │           │                                                       │   │
+│  │           ▼                                                       │   │
+│  │  ┌─────────────────┐   ┌──────────────────────────────────────┐  │   │
+│  │  │  Ollama (local) │   │  PostgreSQL + pgvector               │  │   │
+│  │  │  LLM + Embed    │   │  Memory · Skills · Incidents         │  │   │
+│  │  └─────────────────┘   └──────────────────────────────────────┘  │   │
+│  │           │                                                       │   │
+│  │           ▼                                                       │   │
+│  │  ┌─────────────────┐   ┌──────────────────────────────────────┐  │   │
+│  │  │  SOC Frontend   │   │  Grafana Dashboards                  │  │   │
+│  │  │  (React:5173)   │   │  Overview · Kill Chain · Skills      │  │   │
+│  │  └─────────────────┘   └──────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
+
+## SOC Tool Stack
+
+NexusSOC sits at the end of a real enterprise SOC pipeline. Each layer has a defined role:
+
+| Layer | Tool | Role |
+|---|---|---|
+| Detection | **Wazuh** | SIEM — host-based detection, log aggregation, rule-based alerting |
+| Detection | **Suricata** | IDS/IPS — network signature detection (EVE JSON) |
+| Detection | **Arkime** | Full-packet capture and session indexing |
+| Detection | **Zeek** | Network traffic analysis — DNS, HTTP, notice logs |
+| Orchestration | **Shuffle SOAR** | Central automation hub — receives raw alerts, coordinates enrichment, creates cases, forwards to NexusSOC |
+| Threat Intel | **MISP** | Event-based IOC lookup (`/events/restSearch`) |
+| Enrichment | **Cortex** | Runs VirusTotal (file/IP reputation) and AbuseIPDB analyzers |
+| Threat Intel | **OpenCTI** | GraphQL-based CTI observable lookup |
+| Case Management | **TheHive** | Creates structured cases with enriched context |
+| AI Triage | **NexusSOC** | Final autonomous TP/FP classification, playbook execution, self-learning |
+
+The `shuffle_simulation.py` script simulates this full pipeline end-to-end for testing and demo purposes.
 
 ## Components
 
 ### AI Agent (`ai_agent_src/`)
 The core of the platform. A FastAPI service that:
-- Receives security alerts and classifies them as **True Positive** or **False Positive**
+- Receives enriched cases from Shuffle/TheHive and classifies them as **True Positive** or **False Positive**
 - Uses a local LLM via Ollama — no data leaves your machine
 - Builds a vector memory of every past case and retrieves similar ones at analysis time
 - Learns from analyst feedback and stores reusable detection patterns (skills)
@@ -52,9 +96,23 @@ A React dashboard providing real-time visibility into the agent:
 - **Memory Panel** — analyzed cases with decisions, confidence scores, full analysis summaries, and drill-in detail view
 - **Skills Panel** — learned detection patterns with confidence bars, success rates, MITRE tags, and drill-in detail view
 - **Playbooks Panel** — active playbooks, execution history, and create/delete playbooks from the UI
-- **Simulation Runner** — run the built-in simulation harness from the UI
+- **Simulation Runner** — trigger the Shuffle pipeline simulation from the UI
 
 Both Memory and Skills panels support **analyst feedback** (✓ / ✗ buttons) directly in the table and in the detail view. Feedback is persisted in `localStorage` so it survives page refresh.
+
+### Shuffle Simulation (`ai_agent_src/shuffle_simulation.py`)
+A fully scripted simulation of the SOC pipeline for demo and testing:
+- Generates native-format alerts from Wazuh (EVE JSON), Suricata (EVE JSON), Arkime (session record), and Zeek (notice.log)
+- Runs mock enrichment: MISP event lookup, Cortex VirusTotal + AbuseIPDB, OpenCTI observables
+- Creates TheHive cases with enriched context
+- Assembles and POSTs enriched payloads to NexusSOC `/analyze-case`
+- 16 scenarios across 5 threat groups: ransomware, APT, insider threat, web attacks, DNS exfiltration
+
+```bash
+python ai_agent_src/shuffle_simulation.py
+```
+
+Results are saved to `sim_results.json`.
 
 ### Grafana (`grafana/`)
 Three pre-built dashboards powered directly by PostgreSQL:
@@ -127,6 +185,11 @@ python ai_agent_src/seed_playbooks.py http://localhost:8001
 
 Grafana default login: `admin` / your `DB_PASS` from `.env`
 
+**5. Run the SOC pipeline simulation** (optional)
+```bash
+python ai_agent_src/shuffle_simulation.py
+```
+
 ## Project Structure
 
 ```
@@ -140,7 +203,7 @@ NexusSOC/
 │   ├── correlator.py               # Incident correlation & kill chain tracking
 │   ├── playbooks.py                # Playbook engine (block IP, quarantine, notify)
 │   ├── worker.py                   # Background queue worker (Redis)
-│   ├── advanced_soc_simulation.py  # Built-in simulation harness
+│   ├── shuffle_simulation.py       # Full SOC pipeline simulation (Shuffle SOAR)
 │   ├── seed_playbooks.py           # Seeds default playbooks on first run
 │   ├── requirements.txt
 │   ├── .env.example                # Template — copy to .env and fill in
@@ -149,9 +212,9 @@ NexusSOC/
 │
 ├── grafana/
 │   └── dashboards/                 # Pre-built Grafana dashboard JSON files
-│       ├── soc-overview.json       # Alert volume, TP/FP ratio, confidence trends
-│       ├── incidents-killchain.json# Open incidents, severity, kill chain phases
-│       └── skills-playbooks.json   # Skill confidence, playbook execution counts
+│       ├── soc-overview.json
+│       ├── incidents-killchain.json
+│       └── skills-playbooks.json
 │
 └── soc-frontend/                   # React dashboard (Vite + TypeScript)
     ├── index.html
@@ -159,26 +222,26 @@ NexusSOC/
     ├── tsconfig.json
     ├── package.json
     ├── Dockerfile
-    ├── nginx.conf                  # Production nginx config (used in Docker)
+    ├── nginx.conf
     ├── public/
     │   ├── favicon.svg
     │   └── icons.svg
     └── src/
         ├── main.tsx
         ├── App.tsx
-        ├── types.ts                # Shared TypeScript interfaces
+        ├── types.ts
         ├── components/
-        │   ├── Dashboard.tsx       # Main layout & tab routing
-        │   ├── StatusBar.tsx       # Agent health, TP/FP rate, memory count
+        │   ├── Dashboard.tsx
+        │   ├── StatusBar.tsx
         │   ├── KillChainTimeline.tsx
-        │   ├── MemoryPanel.tsx     # Past cases + analyst feedback
-        │   ├── SkillsPanel.tsx     # Learned detection patterns
-        │   ├── PlaybooksPanel.tsx  # Playbook management & history
+        │   ├── MemoryPanel.tsx
+        │   ├── SkillsPanel.tsx
+        │   ├── PlaybooksPanel.tsx
         │   └── SimulationRunner.tsx
         ├── data/
-        │   └── alerts.ts           # Sample alert payloads for simulation
+        │   └── alerts.ts
         ├── lib/
-        │   └── api.ts              # API client (all backend calls)
+        │   └── api.ts
         └── styles/
             └── global.css
 ```
@@ -187,7 +250,7 @@ NexusSOC/
 
 - All LLM inference runs **locally via Ollama** — no alert data is sent to any external service
 - `.env` is gitignored — never commit it
-- Playbooks run in `DRY_RUN` mode by default — set `PLAYBOOK_DRY_RUN=false` only when your SOC stack (firewall API, EDR, etc.) is connected
+- Playbooks run in `DRY_RUN` mode by default — set `PLAYBOOK_DRY_RUN=false` only when your SOC stack is connected
 - Regenerate your Discord webhook if it was ever accidentally exposed
 
 ## License

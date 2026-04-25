@@ -467,24 +467,68 @@ async def query_ollama(prompt: str, timeout: int = 300) -> dict:
 
 # ── DISCORD ───────────────────────────────────────────────────────────────────
 
-async def send_to_discord(case_id, title, confidence, explanation, decision="True Positive", recommended_action=""):
+async def send_to_discord(
+    case_id, title, confidence, explanation,
+    decision="True Positive", recommended_action="",
+    alert=None,
+):
     if not DISCORD_URL:
         return
-    is_tp = decision == "True Positive"
-    embed_title  = "🚨 TRUE POSITIVE — THREAT CONFIRMED" if is_tp else "✅ FALSE POSITIVE — NO ACTION REQUIRED"
-    embed_color  = 15158332 if is_tp else 3066993  # red : green
-    decision_val = f"⚡ {decision}" if is_tp else f"✓ {decision}"
+    is_tp       = decision.lower() == "true positive"
+    embed_title = "🚨 THREAT CONFIRMED — TRUE POSITIVE" if is_tp else "✅ FALSE POSITIVE — NO ACTION"
+    embed_color = 0xE74C3C if is_tp else 0x2ECC71
+
+    conf_pct = round(confidence * 100, 1)
+    conf_bar = "█" * int(conf_pct // 10) + "░" * (10 - int(conf_pct // 10))
+
+    severity = getattr(alert, "severity",          "—") if alert else "—"
+    attack   = getattr(alert, "attack_type",        "—") if alert else "—"
+    kill_ch  = getattr(alert, "kill_chain_phase",   "—") if alert else "—"
+    hostname = getattr(alert, "hostname",           "")  if alert else ""
+    user     = getattr(alert, "user",               "")  if alert else ""
+    mitre    = getattr(alert, "mitre_techniques",   [])  if alert else []
+    net      = getattr(alert, "network",            None) if alert else None
+    src_ip   = getattr(net, "source_ip", "") if net else ""
+
     fields = [
-        {"name": "Case",       "value": str(case_id),                  "inline": True},
-        {"name": "Decision",   "value": decision_val,                   "inline": True},
-        {"name": "Confidence", "value": f"{round(confidence*100,1)}%",  "inline": True},
-        {"name": "Summary",    "value": explanation[:1000]},
+        {"name": "📋 Case",       "value": f"`{case_id}`",                  "inline": True},
+        {"name": "⚖️ Decision",   "value": f"**{decision}**",               "inline": True},
+        {"name": "📊 Confidence", "value": f"`{conf_bar}` **{conf_pct}%**", "inline": True},
     ]
+
+    ctx = []
+    if severity and severity != "—": ctx.append(f"**Severity:** `{str(severity).upper()}`")
+    if attack   and attack   != "—": ctx.append(f"**Type:** `{attack}`")
+    if kill_ch  and kill_ch  != "—": ctx.append(f"**Kill chain:** `{kill_ch}`")
+    if ctx:
+        fields.append({"name": "🎯 Threat Context", "value": "  ·  ".join(ctx)})
+
+    ids = []
+    if hostname: ids.append(f"**Host:** `{hostname}`")
+    if user:     ids.append(f"**User:** `{user}`")
+    if src_ip:   ids.append(f"**Src IP:** `{src_ip}`")
+    if ids:
+        fields.append({"name": "🖥️ Asset / Identity", "value": "  ·  ".join(ids)})
+
+    if mitre:
+        fields.append({"name": "🛡️ MITRE ATT&CK", "value": "  ".join(f"`{t}`" for t in mitre[:8])})
+
+    fields.append({"name": "🤖 AI Analysis", "value": explanation[:1000]})
+
     if recommended_action:
-        fields.append({"name": "→ Recommended Action", "value": recommended_action[:512]})
+        fields.append({"name": "⚡ Recommended Action", "value": f"```{recommended_action[:480]}```"})
+
+    embed = {
+        "title":       embed_title,
+        "description": f"**{title[:250]}**",
+        "color":       embed_color,
+        "fields":      fields,
+        "footer":      {"text": f"NexusSOC AI Agent  ·  Case {case_id}"},
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+    }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(DISCORD_URL, json={"embeds": [{"title": embed_title, "color": embed_color, "fields": fields}]})
+            await client.post(DISCORD_URL, json={"embeds": [embed]})
     except Exception as e:
         logger.error(f"Discord error: {e}")
 
@@ -664,7 +708,8 @@ async def analyze_case(alert: SecurityAlert, background_tasks: BackgroundTasks):
                 send_to_discord, case_id, alert.title,
                 result['confidence'], result['explanation'],
                 result.get('decision', 'True Positive'),
-                result.get('recommended_action', '')
+                result.get('recommended_action', ''),
+                alert,
             )
 
     return {
