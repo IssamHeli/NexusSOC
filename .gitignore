@@ -1,0 +1,22 @@
+# Secrets & environment
+.env
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+
+# Claude Code local settings
+.claude/
+
+# Generated output
+sim_results.json

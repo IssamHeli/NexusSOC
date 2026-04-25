@@ -1,0 +1,93 @@
+services:
+ 
+  ai-db:
+    image: pgvector/pgvector:pg15
+    container_name: ai-soc-db
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana_mac
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${DB_PASS}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      ai-db:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: nexussoc_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ai-agent-api:
+    build: ./ai_agent_src
+    container_name: ai_agent_bridge
+    restart: on-failure
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8001:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      ai-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: ./ai_agent_src
+    command: python worker.py
+    restart: on-failure
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - WORKER_API_URL=http://ai-agent-api:8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+      ai-agent-api:
+        condition: service_started
+
+  soc-frontend:
+    build:
+      context: ./soc-frontend
+      target: dev
+    container_name: soc_frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./soc-frontend/src:/app/src
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+    depends_on:
+      - ai-agent-api
+
+volumes:
+  postgres_data:
+  grafana_data:

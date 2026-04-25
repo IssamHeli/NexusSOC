@@ -1,0 +1,112 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2761
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx566\tx1133\tx1700\tx2267\tx2834\tx3401\tx3968\tx4535\tx5102\tx5669\tx6236\tx6803\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 -- ============================================\
+-- SOC AI AGENT GRAFANA QUERIES\
+-- ============================================\
+\
+-- 1. TOTAL CASES ANALYZED\
+SELECT COUNT(*) as total_cases\
+FROM ai_analysis;\
+\
+-- 2. DECISION BREAKDOWN\
+SELECT \
+  ai_decision,\
+  COUNT(*) as count,\
+  ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM ai_analysis), 2) as percentage\
+FROM ai_analysis\
+GROUP BY ai_decision\
+ORDER BY count DESC;\
+\
+-- 3. AVERAGE CONFIDENCE\
+SELECT \
+  ai_decision,\
+  ROUND(AVG(confidence)::numeric, 3) as avg_confidence,\
+  MIN(confidence) as min_confidence,\
+  MAX(confidence) as max_confidence,\
+  STDDEV(confidence) as confidence_stddev,\
+  COUNT(*) as count\
+FROM ai_analysis\
+GROUP BY ai_decision;\
+\
+-- 4. CASES BY HOUR (24H)\
+SELECT \
+  DATE_TRUNC('hour', timestamp) as time_bucket,\
+  COUNT(*) as cases,\
+  ROUND(AVG(confidence)::numeric, 2) as avg_confidence\
+FROM ai_analysis\
+WHERE timestamp > NOW() - INTERVAL '24 hours'\
+GROUP BY DATE_TRUNC('hour', timestamp)\
+ORDER BY time_bucket DESC;\
+\
+-- 5. HIGH CONFIDENCE TRUE POSITIVES (Alert Ready)\
+SELECT \
+  case_id,\
+  ai_decision,\
+  ROUND(confidence::numeric, 2) as confidence,\
+  timestamp,\
+  analysis_summary\
+FROM ai_analysis\
+WHERE ai_decision = 'True Positive' \
+  AND confidence >= 0.90\
+ORDER BY timestamp DESC;\
+\
+-- 6. CONFIDENCE DISTRIBUTION\
+SELECT \
+  CASE \
+    WHEN confidence >= 0.95 THEN 'Very High (95-100%)'\
+    WHEN confidence >= 0.85 THEN 'High (85-95%)'\
+    WHEN confidence >= 0.70 THEN 'Medium (70-85%)'\
+    WHEN confidence >= 0.50 THEN 'Low (50-70%)'\
+    ELSE 'Very Low (<50%)'\
+  END as confidence_range,\
+  COUNT(*) as count,\
+  ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM ai_analysis), 2) as percentage\
+FROM ai_analysis\
+GROUP BY confidence_range\
+ORDER BY confidence DESC;\
+\
+-- 7. RECENT ALERT CASES (Last 20)\
+SELECT \
+  case_id,\
+  ai_decision,\
+  ROUND(confidence::numeric, 2) as confidence,\
+  timestamp,\
+  LEFT(analysis_summary, 100) as summary_preview\
+FROM ai_analysis\
+ORDER BY timestamp DESC\
+LIMIT 20;\
+\
+-- 8. CASES WITH LOW CONFIDENCE\
+SELECT \
+  case_id,\
+  ai_decision,\
+  ROUND(confidence::numeric, 2) as confidence,\
+  timestamp\
+FROM ai_analysis\
+WHERE confidence < 0.50\
+ORDER BY timestamp DESC;\
+\
+-- 9. ANALYSIS SUMMARY COUNTS\
+SELECT \
+  ai_decision,\
+  COUNT(*) as total,\
+  ROUND(AVG(confidence)::numeric, 2) as avg_conf,\
+  COUNT(*) FILTER (WHERE confidence >= 0.9) as high_confidence\
+FROM ai_analysis\
+GROUP BY ai_decision;\
+\
+-- 10. CASE ACTIVITY TIMELINE\
+SELECT \
+  DATE(timestamp) as date,\
+  COUNT(*) as daily_cases,\
+  ROUND(AVG(confidence)::numeric, 2) as daily_avg_conf,\
+  COUNT(*) FILTER (WHERE ai_decision = 'True Positive') as true_positives,\
+  COUNT(*) FILTER (WHERE ai_decision = 'False Positive') as false_positives\
+FROM ai_analysis\
+GROUP BY DATE(timestamp)\
+ORDER BY date DESC;}

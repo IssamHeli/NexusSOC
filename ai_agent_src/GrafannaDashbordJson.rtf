@@ -1,0 +1,329 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2761
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx566\tx1133\tx1700\tx2267\tx2834\tx3401\tx3968\tx4535\tx5102\tx5669\tx6236\tx6803\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 \{\
+  "annotations": \{\
+    "list": [\
+      \{\
+        "builtIn": 1,\
+        "datasource": \{\
+          "type": "grafana",\
+          "uid": "-- Grafana --"\
+        \},\
+        "enable": true,\
+        "hide": true,\
+        "iconColor": "rgba(0, 211, 255, 1)",\
+        "name": "Annotations & Alerts",\
+        "type": "dashboard"\
+      \}\
+    ]\
+  \},\
+  "editable": true,\
+  "fiscalYearStartMonth": 0,\
+  "graphTooltip": 0,\
+  "id": null,\
+  "links": [],\
+  "liveNow": false,\
+  "panels": [\
+    \{\
+      "datasource": \{\
+        "type": "postgres",\
+        "uid": "socanalyst_ai_postgresql"\
+      \},\
+      "fieldConfig": \{\
+        "defaults": \{\
+          "color": \{\
+            "mode": "thresholds"\
+          \},\
+          "mappings": [],\
+          "thresholds": \{\
+            "mode": "absolute",\
+            "steps": [\
+              \{\
+                "color": "blue",\
+                "value": null\
+              \}\
+            ]\
+          \}\
+        \},\
+        "overrides": []\
+      \},\
+      "gridPos": \{\
+        "h": 8,\
+        "w": 6,\
+        "x": 0,\
+        "y": 0\
+      \},\
+      "id": 1,\
+      "options": \{\
+        "orientation": "auto",\
+        "textMode": "auto"\
+      \},\
+      "pluginVersion": "10.0.0",\
+      "targets": [\
+        \{\
+          "format": "table",\
+          "rawSql": "SELECT COUNT(*) as total_cases\\nFROM ai_analysis;",\
+          "refId": "A"\
+        \}\
+      ],\
+      "title": "Total Cases Analyzed",\
+      "type": "stat"\
+    \},\
+    \{\
+      "datasource": \{\
+        "type": "postgres",\
+        "uid": "socanalyst_ai_postgresql"\
+      \},\
+      "fieldConfig": \{\
+        "defaults": \{\
+          "color": \{\
+            "mode": "palette-classic"\
+          \},\
+          "custom": \{\
+            "hideFrom": \{\
+              "tooltip": false,\
+              "viz": false,\
+              "legend": false\
+            \}\
+          \},\
+          "mappings": []\
+        \},\
+        "overrides": []\
+      \},\
+      "gridPos": \{\
+        "h": 8,\
+        "w": 6,\
+        "x": 6,\
+        "y": 0\
+      \},\
+      "id": 2,\
+      "options": \{\
+        "legend": \{\
+          "displayMode": "table",\
+          "placement": "right"\
+        \},\
+        "pieType": "donut"\
+      \},\
+      "pluginVersion": "10.0.0",\
+      "targets": [\
+        \{\
+          "format": "table",\
+          "rawSql": "SELECT ai_decision, COUNT(*) as count FROM ai_analysis GROUP BY ai_decision ORDER BY count DESC;",\
+          "refId": "A"\
+        \}\
+      ],\
+      "title": "Decision Distribution",\
+      "type": "piechart"\
+    \},\
+    \{\
+      "datasource": \{\
+        "type": "postgres",\
+        "uid": "socanalyst_ai_postgresql"\
+      \},\
+      "fieldConfig": \{\
+        "defaults": \{\
+          "color": \{\
+            "mode": "thresholds"\
+          \},\
+          "custom": \{\
+            "align": "auto",\
+            "cellOptions": \{\
+              "type": "auto"\
+            \},\
+            "inspect": false\
+          \},\
+          "mappings": [],\
+          "thresholds": \{\
+            "mode": "absolute",\
+            "steps": [\
+              \{\
+                "color": "green",\
+                "value": null\
+              \}\
+            ]\
+          \}\
+        \},\
+        "overrides": []\
+      \},\
+      "gridPos": \{\
+        "h": 8,\
+        "w": 12,\
+        "x": 12,\
+        "y": 0\
+      \},\
+      "id": 3,\
+      "options": \{\
+        "showHeader": true\
+      \},\
+      "pluginVersion": "10.0.0",\
+      "targets": [\
+        \{\
+          "format": "table",\
+          "rawSql": "SELECT ai_decision, ROUND(AVG(confidence)::numeric, 2) as avg_confidence, COUNT(*) as case_count FROM ai_analysis GROUP BY ai_decision;",\
+          "refId": "A"\
+        \}\
+      ],\
+      "title": "Average Confidence by Decision",\
+      "type": "table"\
+    \},\
+    \{\
+      "datasource": \{\
+        "type": "postgres",\
+        "uid": "socanalyst_ai_postgresql"\
+      \},\
+      "fieldConfig": \{\
+        "defaults": \{\
+          "color": \{\
+            "mode": "palette-classic"\
+          \},\
+          "custom": \{\
+            "axisCenteredZero": false,\
+            "axisColorMode": "text",\
+            "axisLabel": "",\
+            "axisPlacement": "auto",\
+            "barAlignment": 0,\
+            "drawStyle": "line",\
+            "fillOpacity": 0,\
+            "gradientMode": "none",\
+            "hideFrom": \{\
+              "tooltip": false,\
+              "viz": false,\
+              "legend": false\
+            \},\
+            "lineInterpolation": "linear",\
+            "lineWidth": 1,\
+            "pointSize": 5,\
+            "scaleDistribution": \{\
+              "type": "linear"\
+            \},\
+            "showPoints": "auto",\
+            "spanNulls": false,\
+            "stacking": \{\
+              "group": "A",\
+              "mode": "none"\
+            \},\
+            "thresholdsStyle": \{\
+              "mode": "off"\
+            \}\
+          \},\
+          "mappings": [],\
+          "thresholds": \{\
+            "mode": "absolute",\
+            "steps": [\
+              \{\
+                "color": "green",\
+                "value": null\
+              \}\
+            ]\
+          \}\
+        \},\
+        "overrides": []\
+      \},\
+      "gridPos": \{\
+        "h": 8,\
+        "w": 12,\
+        "x": 0,\
+        "y": 8\
+      \},\
+      "id": 4,\
+      "options": \{\
+        "legend": \{\
+          "calcs": [],\
+          "displayMode": "list",\
+          "placement": "bottom"\
+        \},\
+        "tooltip": \{\
+          "mode": "single"\
+        \}\
+      \},\
+      "pluginVersion": "10.0.0",\
+      "targets": [\
+        \{\
+          "format": "table",\
+          "rawSql": "SELECT DATE_TRUNC('hour', timestamp) as time_bucket, COUNT(*) as cases FROM ai_analysis WHERE timestamp > NOW() - INTERVAL '24 hours' GROUP BY DATE_TRUNC('hour', timestamp) ORDER BY time_bucket DESC;",\
+          "refId": "A"\
+        \}\
+      ],\
+      "title": "Cases Analyzed (Last 24 Hours)",\
+      "type": "timeseries"\
+    \},\
+    \{\
+      "datasource": \{\
+        "type": "postgres",\
+        "uid": "socanalyst_ai_postgresql"\
+      \},\
+      "fieldConfig": \{\
+        "defaults": \{\
+          "color": \{\
+            "mode": "thresholds"\
+          \},\
+          "custom": \{\
+            "align": "auto",\
+            "cellOptions": \{\
+              "type": "auto"\
+            \},\
+            "inspect": false\
+          \},\
+          "mappings": [],\
+          "thresholds": \{\
+            "mode": "absolute",\
+            "steps": [\
+              \{\
+                "color": "green",\
+                "value": null\
+              \}\
+            ]\
+          \}\
+        \},\
+        "overrides": []\
+      \},\
+      "gridPos": \{\
+        "h": 8,\
+        "w": 12,\
+        "x": 12,\
+        "y": 8\
+      \},\
+      "id": 5,\
+      "options": \{\
+        "showHeader": true\
+      \},\
+      "pluginVersion": "10.0.0",\
+      "targets": [\
+        \{\
+          "format": "table",\
+          "rawSql": "SELECT case_id, ai_decision, ROUND(confidence::numeric, 2) as confidence, timestamp FROM ai_analysis WHERE confidence > 0.9 ORDER BY timestamp DESC LIMIT 10;",\
+          "refId": "A"\
+        \}\
+      ],\
+      "title": "High Confidence Alerts (>90%)",\
+      "type": "table"\
+    \}\
+  ],\
+  "refresh": "30s",\
+  "schemaVersion": 38,\
+  "style": "dark",\
+  "tags": [\
+    "SOC",\
+    "AI",\
+    "Security",\
+    "Analysis"\
+  ],\
+  "templating": \{\
+    "list": []\
+  \},\
+  "time": \{\
+    "from": "now-7d",\
+    "to": "now"\
+  \},\
+  "timepicker": \{\},\
+  "timezone": "",\
+  "title": "SOC AI Agent Analytics",\
+  "uid": "soc-ai-agent",\
+  "version": 1,\
+  "weekStart": ""\
+\}}
