@@ -20,5 +20,9 @@ dist-ssr/
 CLAUDE.MD
 memory
 
+# Claude project memory & instructions (local only)
+CLAUDE.md
+memory/
+
 # Generated output
 sim_results.json
