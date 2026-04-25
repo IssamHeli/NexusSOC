@@ -17,8 +17,6 @@ dist-ssr/
 
 # Claude Code local settings
 .claude/
-CLAUDE.MD
-memory
 
 # Claude project memory & instructions (local only)
 CLAUDE.md
