@@ -249,9 +249,8 @@ NexusSOC/
 ## Security Notes
 
 - All LLM inference runs **locally via Ollama** — no alert data is sent to any external service
-- `.env` is gitignored — never commit it
 - Playbooks run in `DRY_RUN` mode by default — set `PLAYBOOK_DRY_RUN=false` only when your SOC stack is connected
-- Regenerate your Discord webhook if it was ever accidentally exposed
+
 
 ## License
 
