@@ -365,6 +365,7 @@ NexusSOC ships with a defensive baseline. Highlights:
 - **No `eval`, `exec`, `pickle`, `yaml.load`, or `shell=True`** anywhere in the codebase.
 - **Audit trail** for every state-changing endpoint with username, IP, status, and duration.
 - **Non-root containers** with network isolation (frontend ↔ api only; api ↔ db / redis / ollama).
+- **Playbooks default to `DRY_RUN`.** Real webhook actions only fire when `PLAYBOOK_DRY_RUN=false`.
 
 If you discover a security issue, please open a private advisory on GitHub rather than a public issue.
 
