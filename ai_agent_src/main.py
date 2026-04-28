@@ -31,8 +31,10 @@ from security import (
 )
 from plugins.loader import PluginLoader
 from connectors import CONNECTOR_REGISTRY
+from llm import LLMRouter, LLMError
 
 plugin_loader = PluginLoader()
+llm_router    = LLMRouter()
 
 # ── METRICS ──────────────────────────────────────────────────────────────────
 
@@ -88,7 +90,6 @@ OLLAMA_HOST   = os.getenv("OLLAMA_HOST", "host.docker.internal")
 OLLAMA_PORT   = os.getenv("OLLAMA_PORT", "11434")
 OLLAMA_MODEL  = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
 EMBED_MODEL   = os.getenv("EMBED_MODEL", "nomic-embed-text")
-OLLAMA_URL    = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
 EMBED_URL     = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/embeddings"
 EMBED_DIM     = 768
 
@@ -360,7 +361,7 @@ Respond ONLY with valid JSON:
 {{"skill_name": "short name", "pattern": "generalizable detection rule in 1-2 sentences", "mitre_techniques": ["T1xxx"]}}
 [/INST]"""
 
-        skill_result = await query_ollama(skill_prompt, timeout=180)
+        skill_result = await llm_router.analyze(skill_prompt, timeout=180)
         skill_name = skill_result.get("skill_name", f"Skill from {alert.attack_type}")
         pattern    = skill_result.get("pattern", result.get("explanation", "")[:300])
         mitre      = skill_result.get("mitre_techniques", alert.mitre_techniques or [])
@@ -419,30 +420,6 @@ async def update_skill_feedback(pool, case_id: str, correct: bool):
 
     except Exception as e:
         logger.warning(f"Skill feedback update failed: {e}")
-
-# ── OLLAMA ────────────────────────────────────────────────────────────────────
-
-async def query_ollama(prompt: str, timeout: int = 300) -> dict:
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(
-                OLLAMA_URL,
-                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "format": "json", "think": False}
-            )
-            if r.status_code != 200:
-                raise HTTPException(status_code=r.status_code, detail=f"Ollama error: {r.text[:200]}")
-            raw = r.json().get("response", "")
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw, re.DOTALL)
-                if match:
-                    return json.loads(match.group())
-                raise ValueError("Could not parse JSON from Ollama")
-    except httpx.ReadTimeout:
-        raise HTTPException(status_code=504, detail=f"Ollama timeout. Model loaded? ollama pull {OLLAMA_MODEL}")
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Cannot reach Ollama. Run: ollama serve")
 
 # ── BUILD PROMPT ──────────────────────────────────────────────────────────────
 
@@ -568,7 +545,10 @@ async def analyze_case(
 
     # 3. Build prompt and query AI
     prompt = build_prompt(alert, memories, skills)
-    result = await query_ollama(prompt, timeout=300)
+    try:
+        result = await llm_router.analyze(prompt, timeout=300)
+    except LLMError as exc:
+        raise HTTPException(status_code=503, detail=f"LLM unavailable: {exc}")
 
     if not all(k in result for k in ['decision', 'confidence', 'explanation']):
         raise HTTPException(status_code=500, detail="Invalid AI response structure")
@@ -961,6 +941,8 @@ async def health():
         "names":      list(CONNECTOR_REGISTRY.keys()),
     }
 
+    llm_info = llm_router.status()
+
     services = {
         "database":   db_info,
         "redis":      redis_info,
@@ -968,6 +950,7 @@ async def health():
         "worker":     worker_info,
         "plugins":    plugins_info,
         "connectors": connectors_info,
+        "llm":        llm_info,
     }
 
     core_down    = db_info["status"] == "down"
@@ -983,6 +966,7 @@ async def health():
         "services":         services,
         # Legacy top-level fields for backward compat
         "database":         db_info["status"],
+        "llm_backend":      llm_info["primary"],
         "ollama_model":     OLLAMA_MODEL,
         "embed_model":      EMBED_MODEL,
         "skills_learned":   db_info["skill_count"],
