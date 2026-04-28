@@ -2,15 +2,18 @@ import os
 import json
 import re
 import uuid
+import time
 import httpx
 import asyncpg
 import asyncio
 import logging
 import redis.asyncio as aioredis
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Counter, Histogram, Gauge
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from contextlib import asynccontextmanager
 from typing import Optional, List
 from datetime import datetime, timezone
@@ -18,6 +21,39 @@ from enum import Enum
 
 from playbooks import execute_playbooks
 from correlator import correlate_alert
+from auth import router as auth_router, user_router, get_current_user, require_role, seed_admin
+from security import (
+    SecurityHeadersMiddleware,
+    RequestSizeLimitMiddleware,
+    RateLimitMiddleware,
+    AuditLogMiddleware,
+    is_safe_webhook_url,
+)
+from plugins.loader import PluginLoader
+from connectors import CONNECTOR_REGISTRY
+
+plugin_loader = PluginLoader()
+
+# ── METRICS ──────────────────────────────────────────────────────────────────
+
+ALERTS_COUNTER = Counter(
+    "nexussoc_alerts_total",
+    "Total alerts analyzed by decision and source",
+    ["decision", "source"],
+)
+ANALYSIS_DURATION = Histogram(
+    "nexussoc_analysis_duration_seconds",
+    "End-to-end alert analysis duration in seconds",
+    buckets=[1, 2, 5, 10, 30, 60, 120, 300],
+)
+CONFIDENCE_GAUGE = Gauge(
+    "nexussoc_confidence_score",
+    "Confidence score of the most recent analysis",
+)
+QUEUE_DEPTH_GAUGE = Gauge(
+    "nexussoc_queue_depth",
+    "Current number of jobs waiting in the Redis queue",
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,7 +79,7 @@ except ValueError as e:
     logger.error(str(e))
     raise
 
-DISCORD_URL   = os.getenv("DISCORD_WEBHOOK", "").strip()
+DISCORD_URL   = os.getenv("DISCORD_WEBHOOK", "").strip()  # kept for playbook context
 REDIS_URL     = os.getenv("REDIS_URL", "").strip()
 QUEUE_KEY     = "nexussoc:queue"
 JOB_PREFIX    = "nexussoc:job:"
@@ -64,89 +100,16 @@ SKILL_EMA_ALPHA              = 0.15   # learning rate for confidence updates
 
 logger.info(f"Model={OLLAMA_MODEL} | Embed={EMBED_MODEL} | DB={CONFIG['db_host']}")
 
-# ── DB INIT ─────────────────────────────────────────────────────────────────
 
-INIT_SQL = """
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE IF NOT EXISTS ai_analysis (
-    id               SERIAL PRIMARY KEY,
-    timestamp        TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    case_id          VARCHAR(100) NOT NULL,
-    raw_alert        JSONB,
-    ai_decision      VARCHAR(50),
-    confidence       FLOAT,
-    analysis_summary TEXT,
-    recommended_action TEXT
-);
-ALTER TABLE ai_analysis ADD COLUMN IF NOT EXISTS embedding vector({dim});
-
-CREATE INDEX IF NOT EXISTS idx_case_id   ON ai_analysis(case_id);
-CREATE INDEX IF NOT EXISTS idx_timestamp ON ai_analysis(timestamp);
-CREATE INDEX IF NOT EXISTS idx_mem_embed ON ai_analysis
-    USING hnsw (embedding vector_cosine_ops)
-    WHERE embedding IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS soc_skills (
-    id               SERIAL PRIMARY KEY,
-    created_at       TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    updated_at       TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    skill_name       VARCHAR(200) NOT NULL,
-    pattern          TEXT NOT NULL,
-    decision         VARCHAR(50),
-    embedding        vector({dim}),
-    confidence_score FLOAT DEFAULT 0.70,
-    usage_count      INT   DEFAULT 0,
-    success_count    INT   DEFAULT 0,
-    mitre_techniques TEXT[]
-);
-CREATE INDEX IF NOT EXISTS idx_skill_embed ON soc_skills
-    USING hnsw (embedding vector_cosine_ops)
-    WHERE embedding IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS soc_playbooks (
-    id                     SERIAL PRIMARY KEY,
-    created_at             TIMESTAMPTZ DEFAULT NOW(),
-    name                   VARCHAR(200) NOT NULL,
-    description            TEXT,
-    trigger_decision       VARCHAR(50)  NOT NULL DEFAULT 'True Positive',
-    trigger_min_confidence FLOAT        NOT NULL DEFAULT 0.85,
-    trigger_attack_types   TEXT[],
-    actions                JSONB        NOT NULL DEFAULT '[]',
-    enabled                BOOLEAN      NOT NULL DEFAULT TRUE,
-    execution_count        INT          NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS soc_playbook_executions (
-    id            SERIAL PRIMARY KEY,
-    executed_at   TIMESTAMPTZ DEFAULT NOW(),
-    case_id       VARCHAR(100) NOT NULL,
-    playbook_id   INT REFERENCES soc_playbooks(id) ON DELETE SET NULL,
-    playbook_name VARCHAR(200),
-    actions_taken JSONB
-);
-CREATE INDEX IF NOT EXISTS idx_pb_exec_case ON soc_playbook_executions(case_id);
-
-CREATE TABLE IF NOT EXISTS soc_incidents (
-    id                SERIAL PRIMARY KEY,
-    created_at        TIMESTAMPTZ DEFAULT NOW(),
-    updated_at        TIMESTAMPTZ DEFAULT NOW(),
-    incident_id       VARCHAR(100) UNIQUE NOT NULL,
-    title             TEXT,
-    status            VARCHAR(50)  NOT NULL DEFAULT 'open',
-    severity          VARCHAR(50)  NOT NULL DEFAULT 'medium',
-    case_ids          TEXT[]       NOT NULL DEFAULT '{{}}',
-    kill_chain_phases TEXT[]       NOT NULL DEFAULT '{{}}',
-    source_ips        TEXT[]       NOT NULL DEFAULT '{{}}',
-    hostnames         TEXT[]       NOT NULL DEFAULT '{{}}',
-    users             TEXT[]       NOT NULL DEFAULT '{{}}',
-    attack_types      TEXT[]       NOT NULL DEFAULT '{{}}',
-    mitre_techniques  TEXT[]       NOT NULL DEFAULT '{{}}',
-    case_count        INT          NOT NULL DEFAULT 1
-);
-CREATE INDEX IF NOT EXISTS idx_inc_status  ON soc_incidents(status);
-CREATE INDEX IF NOT EXISTS idx_inc_updated ON soc_incidents(updated_at);
-""".format(dim=EMBED_DIM)
+async def _poll_queue_depth(redis_client) -> None:
+    """Update queue depth gauge every 30 s."""
+    while True:
+        try:
+            depth = await redis_client.llen(QUEUE_KEY)
+            QUEUE_DEPTH_GAUGE.set(depth)
+        except Exception:
+            pass
+        await asyncio.sleep(30)
 
 # ── LIFESPAN ─────────────────────────────────────────────────────────────────
 
@@ -158,12 +121,13 @@ async def lifespan(app: FastAPI):
         database=CONFIG["db_name"], host=CONFIG["db_host"],
         port=CONFIG["db_port"], min_size=5, max_size=20
     )
-    async with app.state.db_pool.acquire() as conn:
-        await conn.execute(INIT_SQL)
-    logger.info("DB ready with pgvector + skills tables")
+    logger.info("DB pool ready — schema managed by Alembic")
+    plugin_loader.load_all()
+    await seed_admin(app.state.db_pool)
     if REDIS_URL:
         app.state.redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
         logger.info("Redis queue ready: %s", REDIS_URL)
+        asyncio.create_task(_poll_queue_depth(app.state.redis))
     else:
         app.state.redis = None
         logger.info("Redis not configured — async ingest disabled")
@@ -175,17 +139,31 @@ async def lifespan(app: FastAPI):
 # ── APP ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="SOC AI Agent",
-    description="AI-powered SOC analyst with memory, pgvector similarity, and self-updating skills",
+    title="NexusSOC AI Agent",
+    description="AI-powered SOC analyst with memory, pgvector similarity, self-updating skills, and JWT auth",
     version="2.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
+
+# Security middleware (order matters — outermost runs first on request, last on response)
+app.add_middleware(AuditLogMiddleware)
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(RequestSizeLimitMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
+
+_CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_CORS_ORIGINS,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+    allow_credentials=True,
 )
+
+app.include_router(auth_router)
+app.include_router(user_router)
+
+Instrumentator().instrument(app).expose(app, include_in_schema=False)
 
 # ── ENUMS ─────────────────────────────────────────────────────────────────────
 
@@ -278,10 +256,10 @@ class SecurityAlert(BaseModel):
     vt_total:          Optional[int]       = Field(None, ge=0, description="VirusTotal total engines scanned")
     vt_names:          Optional[List[str]] = Field(None, description="Known malware names from VirusTotal")
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True, extra="forbid")
 
-    @validator('timestamp')
+    @field_validator('timestamp')
+    @classmethod
     def validate_timestamp(cls, v):
         if v:
             try:
@@ -291,6 +269,7 @@ class SecurityAlert(BaseModel):
         return v
 
 class FeedbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     correct:      bool
     analyst_note: Optional[str] = None
 
@@ -465,73 +444,6 @@ async def query_ollama(prompt: str, timeout: int = 300) -> dict:
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="Cannot reach Ollama. Run: ollama serve")
 
-# ── DISCORD ───────────────────────────────────────────────────────────────────
-
-async def send_to_discord(
-    case_id, title, confidence, explanation,
-    decision="True Positive", recommended_action="",
-    alert=None,
-):
-    if not DISCORD_URL:
-        return
-    is_tp       = decision.lower() == "true positive"
-    embed_title = "🚨 THREAT CONFIRMED — TRUE POSITIVE" if is_tp else "✅ FALSE POSITIVE — NO ACTION"
-    embed_color = 0xE74C3C if is_tp else 0x2ECC71
-
-    conf_pct = round(confidence * 100, 1)
-    conf_bar = "█" * int(conf_pct // 10) + "░" * (10 - int(conf_pct // 10))
-
-    severity = getattr(alert, "severity",          "—") if alert else "—"
-    attack   = getattr(alert, "attack_type",        "—") if alert else "—"
-    kill_ch  = getattr(alert, "kill_chain_phase",   "—") if alert else "—"
-    hostname = getattr(alert, "hostname",           "")  if alert else ""
-    user     = getattr(alert, "user",               "")  if alert else ""
-    mitre    = getattr(alert, "mitre_techniques",   [])  if alert else []
-    net      = getattr(alert, "network",            None) if alert else None
-    src_ip   = getattr(net, "source_ip", "") if net else ""
-
-    fields = [
-        {"name": "📋 Case",       "value": f"`{case_id}`",                  "inline": True},
-        {"name": "⚖️ Decision",   "value": f"**{decision}**",               "inline": True},
-        {"name": "📊 Confidence", "value": f"`{conf_bar}` **{conf_pct}%**", "inline": True},
-    ]
-
-    ctx = []
-    if severity and severity != "—": ctx.append(f"**Severity:** `{str(severity).upper()}`")
-    if attack   and attack   != "—": ctx.append(f"**Type:** `{attack}`")
-    if kill_ch  and kill_ch  != "—": ctx.append(f"**Kill chain:** `{kill_ch}`")
-    if ctx:
-        fields.append({"name": "🎯 Threat Context", "value": "  ·  ".join(ctx)})
-
-    ids = []
-    if hostname: ids.append(f"**Host:** `{hostname}`")
-    if user:     ids.append(f"**User:** `{user}`")
-    if src_ip:   ids.append(f"**Src IP:** `{src_ip}`")
-    if ids:
-        fields.append({"name": "🖥️ Asset / Identity", "value": "  ·  ".join(ids)})
-
-    if mitre:
-        fields.append({"name": "🛡️ MITRE ATT&CK", "value": "  ".join(f"`{t}`" for t in mitre[:8])})
-
-    fields.append({"name": "🤖 AI Analysis", "value": explanation[:1000]})
-
-    if recommended_action:
-        fields.append({"name": "⚡ Recommended Action", "value": f"```{recommended_action[:480]}```"})
-
-    embed = {
-        "title":       embed_title,
-        "description": f"**{title[:250]}**",
-        "color":       embed_color,
-        "fields":      fields,
-        "footer":      {"text": f"NexusSOC AI Agent  ·  Case {case_id}"},
-        "timestamp":   datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(DISCORD_URL, json={"embeds": [embed]})
-    except Exception as e:
-        logger.error(f"Discord error: {e}")
-
 # ── BUILD PROMPT ──────────────────────────────────────────────────────────────
 
 def build_prompt(alert: SecurityAlert, memories: List[dict], skills: List[dict]) -> str:
@@ -628,7 +540,12 @@ Respond with ONLY valid JSON (no extra text):
 # ── ENDPOINTS ─────────────────────────────────────────────────────────────────
 
 @app.post("/analyze-case")
-async def analyze_case(alert: SecurityAlert, background_tasks: BackgroundTasks):
+async def analyze_case(
+    alert: SecurityAlert,
+    background_tasks: BackgroundTasks,
+    _user: dict = Depends(require_role("analyst")),
+):
+    _t0 = time.monotonic()
     case_id = alert.sourceRef
     logger.info(f"Analyzing: {case_id}")
 
@@ -678,10 +595,18 @@ async def analyze_case(alert: SecurityAlert, background_tasks: BackgroundTasks):
                 (case_id, raw_alert, ai_decision, confidence, analysis_summary, recommended_action, embedding)
             VALUES ($1, $2, $3, $4, $5, $6, {vec_sql})
         """,
-            case_id, json.dumps(alert.dict()),
+            case_id, json.dumps(alert.model_dump()),
             result['decision'], result['confidence'],
             result['explanation'], result['recommended_action']
         )
+
+    # Record metrics after save
+    ANALYSIS_DURATION.observe(time.monotonic() - _t0)
+    ALERTS_COUNTER.labels(
+        decision=result["decision"],
+        source=str(alert.source or "unknown"),
+    ).inc()
+    CONFIDENCE_GAUGE.set(result["confidence"])
 
     # 5. Correlate alert → incidents
     incident_info = await correlate_alert(app.state.db_pool, alert, result, embedding)
@@ -697,7 +622,8 @@ async def analyze_case(alert: SecurityAlert, background_tasks: BackgroundTasks):
             app.state.db_pool, alert, result, discord_url=DISCORD_URL
         )
 
-    # 7. Discord alert for critical true positives (fallback if no playbook covers it)
+    # 7. Notify all loaded notification plugins for high-confidence TPs
+    #    (skipped if a playbook Discord action already fired)
     if result['decision'].lower() == "true positive" and result['confidence'] >= 0.90:
         pb_has_discord = any(
             any(a.get("type") == "discord" for a in pb.get("actions", []))
@@ -705,9 +631,10 @@ async def analyze_case(alert: SecurityAlert, background_tasks: BackgroundTasks):
         )
         if not pb_has_discord:
             background_tasks.add_task(
-                send_to_discord, case_id, alert.title,
-                result['confidence'], result['explanation'],
+                plugin_loader.notify_all,
+                case_id, alert.title,
                 result.get('decision', 'True Positive'),
+                result['confidence'], result['explanation'],
                 result.get('recommended_action', ''),
                 alert,
             )
@@ -724,7 +651,12 @@ async def analyze_case(alert: SecurityAlert, background_tasks: BackgroundTasks):
 
 
 @app.post("/feedback/{case_id}")
-async def feedback(case_id: str, body: FeedbackRequest, background_tasks: BackgroundTasks):
+async def feedback(
+    case_id: str,
+    body: FeedbackRequest,
+    background_tasks: BackgroundTasks,
+    _user: dict = Depends(require_role("analyst")),
+):
     """Analyst confirms or denies the agent's decision — updates skill confidence via EMA."""
     async with app.state.db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -746,7 +678,11 @@ async def feedback(case_id: str, body: FeedbackRequest, background_tasks: Backgr
 
 
 @app.get("/skills")
-async def list_skills(min_confidence: float = 0.0, limit: int = 50):
+async def list_skills(
+    min_confidence: float = 0.0,
+    limit: int = 50,
+    _user: dict = Depends(require_role("viewer")),
+):
     """List all learned skills, optionally filtered by confidence."""
     async with app.state.db_pool.acquire() as conn:
         rows = await conn.fetch("""
@@ -764,7 +700,7 @@ async def list_skills(min_confidence: float = 0.0, limit: int = 50):
 
 
 @app.delete("/skills/{skill_id}")
-async def delete_skill(skill_id: int):
+async def delete_skill(skill_id: int, _user: dict = Depends(require_role("admin"))):
     """Remove a skill that is consistently wrong or irrelevant."""
     async with app.state.db_pool.acquire() as conn:
         result = await conn.execute("DELETE FROM soc_skills WHERE id = $1", skill_id)
@@ -774,12 +710,17 @@ async def delete_skill(skill_id: int):
 
 
 class SkillFeedbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     correct: bool
     analyst_note: Optional[str] = None
 
 
 @app.post("/skills/{skill_id}/feedback")
-async def skill_feedback(skill_id: int, body: SkillFeedbackRequest):
+async def skill_feedback(
+    skill_id: int,
+    body: SkillFeedbackRequest,
+    _user: dict = Depends(require_role("analyst")),
+):
     """Directly rate a skill pattern — applies EMA to confidence_score."""
     async with app.state.db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -814,7 +755,7 @@ async def skill_feedback(skill_id: int, body: SkillFeedbackRequest):
 
 
 @app.get("/memory")
-async def get_memory(limit: int = 20):
+async def get_memory(limit: int = 20, _user: dict = Depends(require_role("viewer"))):
     """View recent case memories stored by the agent."""
     async with app.state.db_pool.acquire() as conn:
         rows = await conn.fetch("""
@@ -831,13 +772,17 @@ async def get_memory(limit: int = 20):
 # ── ASYNC INGEST (queue-backed) ───────────────────────────────────────────────
 
 @app.post("/ingest", status_code=202)
-async def ingest_alert(alert: SecurityAlert, request: Request):
+async def ingest_alert(
+    alert: SecurityAlert,
+    request: Request,
+    _user: dict = Depends(require_role("analyst")),
+):
     rc = request.app.state.redis
     if not rc:
         raise HTTPException(status_code=503, detail="Queue unavailable — REDIS_URL not configured")
     job_id    = str(uuid.uuid4())
-    case_id   = alert.case_id or job_id
-    payload   = json.loads(alert.json())
+    case_id   = alert.sourceRef or job_id
+    payload   = json.loads(alert.model_dump_json())
     payload["_job_id"]   = job_id
     payload["timestamp"] = payload.get("timestamp") or datetime.now(timezone.utc).isoformat()
     await rc.hset(f"{JOB_PREFIX}{job_id}", mapping={
@@ -852,7 +797,7 @@ async def ingest_alert(alert: SecurityAlert, request: Request):
 
 
 @app.get("/jobs/{job_id}")
-async def get_job(job_id: str, request: Request):
+async def get_job(job_id: str, request: Request, _user: dict = Depends(require_role("analyst"))):
     rc = request.app.state.redis
     if not rc:
         raise HTTPException(status_code=503, detail="Queue unavailable — REDIS_URL not configured")
@@ -865,7 +810,7 @@ async def get_job(job_id: str, request: Request):
 
 
 @app.get("/queue/depth")
-async def queue_depth(request: Request):
+async def queue_depth(request: Request, _user: dict = Depends(require_role("viewer"))):
     rc = request.app.state.redis
     if not rc:
         return {"depth": 0, "redis": False}
@@ -873,119 +818,221 @@ async def queue_depth(request: Request):
     return {"depth": depth, "redis": True, "queue": QUEUE_KEY}
 
 
+@app.get("/queue/dlq")
+async def dead_letter_queue(
+    limit: int = 20,
+    request: Request = None,
+    _user: dict = Depends(require_role("admin")),
+):
+    """Inspect dead-letter queue — jobs that failed all 3 retries."""
+    rc = request.app.state.redis
+    if not rc:
+        return {"total": 0, "jobs": [], "redis": False}
+    raw = await rc.lrange("nexussoc:dlq", 0, limit - 1)
+    total = await rc.llen("nexussoc:dlq")
+    jobs = []
+    for entry in raw:
+        try:
+            jobs.append(json.loads(entry))
+        except Exception:
+            jobs.append({"raw": entry})
+    return {"total": total, "limit": limit, "jobs": jobs}
+
+
+@app.post("/queue/dlq/clear")
+async def dlq_clear(request: Request, _user: dict = Depends(require_role("admin"))):
+    """Drop every job from the dead-letter queue."""
+    rc = request.app.state.redis
+    if not rc:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    removed = await rc.llen("nexussoc:dlq")
+    await rc.delete("nexussoc:dlq")
+    return {"cleared": int(removed)}
+
+
+@app.post("/queue/dlq/requeue-all")
+async def dlq_requeue_all(request: Request, _user: dict = Depends(require_role("admin"))):
+    """Move every dead job back into the main queue with attempt counter reset."""
+    rc = request.app.state.redis
+    if not rc:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    requeued, failed = 0, 0
+    while True:
+        entry = await rc.lpop("nexussoc:dlq")
+        if entry is None:
+            break
+        try:
+            job = json.loads(entry)
+            payload = job.get("alert", {})
+            payload["_job_id"]  = job.get("job_id", str(uuid.uuid4()))
+            payload["_attempt"] = 1
+            await rc.lpush(QUEUE_KEY, json.dumps(payload, default=str))
+            requeued += 1
+        except Exception as exc:
+            logger.warning("DLQ requeue parse failed: %s", exc)
+            failed += 1
+    return {"requeued": requeued, "failed": failed}
+
+
 @app.get("/health")
 async def health():
-    db_status = "disconnected"
-    skill_count = 0
-    memory_count = 0
-    try:
-        async with app.state.db_pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
-            skill_count  = await conn.fetchval("SELECT COUNT(*) FROM soc_skills")
-            memory_count = await conn.fetchval("SELECT COUNT(*) FROM ai_analysis WHERE embedding IS NOT NULL")
-        db_status = "connected"
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
+    async def _check_db():
+        t0 = time.monotonic()
+        try:
+            async with app.state.db_pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+                skills  = await conn.fetchval("SELECT COUNT(*) FROM soc_skills")
+                mems    = await conn.fetchval("SELECT COUNT(*) FROM ai_analysis WHERE embedding IS NOT NULL")
+                pgvec   = await conn.fetchval(
+                    "SELECT COUNT(*) FROM pg_extension WHERE extname = 'vector'"
+                )
+            return {
+                "status":       "ok",
+                "latency_ms":   int((time.monotonic() - t0) * 1000),
+                "pgvector":     bool(pgvec),
+                "skill_count":  int(skills),
+                "memory_count": int(mems),
+            }
+        except Exception as e:
+            logger.warning("Health DB: %s", e)
+            return {"status": "down", "latency_ms": None, "pgvector": False, "skill_count": 0, "memory_count": 0}
+
+    async def _check_redis():
+        rc = app.state.redis
+        if not rc:
+            return {"status": "disabled", "latency_ms": None, "queue_depth": 0, "dlq_depth": 0}
+        t0 = time.monotonic()
+        try:
+            await rc.ping()
+            latency     = int((time.monotonic() - t0) * 1000)
+            queue_depth = int(await rc.llen(QUEUE_KEY))
+            dlq_depth   = int(await rc.llen("nexussoc:dlq"))
+            return {"status": "ok", "latency_ms": latency, "queue_depth": queue_depth, "dlq_depth": dlq_depth}
+        except Exception:
+            return {"status": "down", "latency_ms": None, "queue_depth": 0, "dlq_depth": 0}
+
+    async def _check_worker():
+        rc = app.state.redis
+        if not rc:
+            return {"status": "unknown", "last_heartbeat_s": None}
+        try:
+            raw = await rc.get("nexussoc:worker:heartbeat")
+            if raw is None:
+                return {"status": "stale", "last_heartbeat_s": None}
+            age = int(time.time() - float(raw))
+            return {"status": "ok" if age < 60 else "stale", "last_heartbeat_s": age}
+        except Exception:
+            return {"status": "unknown", "last_heartbeat_s": None}
+
+    async def _check_ollama():
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                r = await client.get(f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/tags")
+                if r.status_code != 200:
+                    return {"status": "degraded", "latency_ms": None, "active_model": None, "available_models": []}
+                latency   = int((time.monotonic() - t0) * 1000)
+                available = [m.get("name") for m in r.json().get("models", []) if m.get("name")]
+                ps        = await client.get(f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/ps")
+                active    = None
+                if ps.status_code == 200:
+                    loaded = ps.json().get("models", [])
+                    if loaded:
+                        active = loaded[0].get("name")
+                return {"status": "ok", "latency_ms": latency, "active_model": active, "available_models": available}
+        except Exception:
+            return {"status": "down", "latency_ms": None, "active_model": None, "available_models": []}
+
+    db_info, redis_info, worker_info, ollama_info = await asyncio.gather(
+        _check_db(), _check_redis(), _check_worker(), _check_ollama()
+    )
+
+    plugin_statuses = plugin_loader.status()
+    plugins_loaded  = sum(1 for p in plugin_statuses if p["loaded"])
+    plugins_total   = len(plugin_statuses)
+    plugins_info    = {
+        "status":  "ok" if plugins_loaded == plugins_total and plugins_total > 0 else ("partial" if plugins_loaded > 0 else "none"),
+        "loaded":  plugins_loaded,
+        "total":   plugins_total,
+    }
+
+    connectors_info = {
+        "registered": len(CONNECTOR_REGISTRY),
+        "names":      list(CONNECTOR_REGISTRY.keys()),
+    }
+
+    services = {
+        "database":   db_info,
+        "redis":      redis_info,
+        "ollama":     ollama_info,
+        "worker":     worker_info,
+        "plugins":    plugins_info,
+        "connectors": connectors_info,
+    }
+
+    core_down    = db_info["status"] == "down"
+    any_degraded = any(
+        s.get("status") in ("down", "degraded", "stale")
+        for k, s in services.items()
+        if isinstance(s, dict) and k not in ("plugins", "connectors", "worker")
+    )
+    overall = "unhealthy" if core_down else ("degraded" if any_degraded else "healthy")
+
     return {
-        "status":           "healthy" if db_status == "connected" else "unhealthy",
-        "database":         db_status,
+        "status":           overall,
+        "services":         services,
+        # Legacy top-level fields for backward compat
+        "database":         db_info["status"],
         "ollama_model":     OLLAMA_MODEL,
         "embed_model":      EMBED_MODEL,
-        "skills_learned":   skill_count,
-        "memories_indexed": memory_count,
+        "skills_learned":   db_info["skill_count"],
+        "memories_indexed": db_info["memory_count"],
         "playbook_mode":    "dry_run" if os.getenv("PLAYBOOK_DRY_RUN", "true").lower() == "true" else "live",
     }
 
 
+@app.get("/plugins")
+async def list_plugins(_user: dict = Depends(require_role("viewer"))):
+    return {"plugins": plugin_loader.status()}
+
+
 @app.get("/mitre/export")
-async def mitre_export():
-    """Export MITRE ATT&CK Navigator layer from all learned skills + analyzed cases."""
-    async with app.state.db_pool.acquire() as conn:
-        skill_rows = await conn.fetch("""
-            SELECT mitre_techniques, confidence_score, usage_count
-            FROM soc_skills
-            WHERE mitre_techniques IS NOT NULL AND array_length(mitre_techniques, 1) > 0
-        """)
-        alert_rows = await conn.fetch("""
-            SELECT raw_alert->>'mitre_techniques' AS techniques, confidence
-            FROM ai_analysis
-            WHERE raw_alert ? 'mitre_techniques'
-              AND raw_alert->>'mitre_techniques' IS NOT NULL
-        """)
-
-    # Aggregate: technique_id -> {total_score, count}
-    scores: dict[str, dict] = {}
-
-    for row in skill_rows:
-        for tech in (row["mitre_techniques"] or []):
-            tid = tech.strip().upper()
-            if not tid:
-                continue
-            entry = scores.setdefault(tid, {"score_sum": 0.0, "count": 0, "sources": []})
-            entry["score_sum"] += float(row["confidence_score"] or 0) * 100
-            entry["count"]     += max(1, int(row["usage_count"] or 1))
-            entry["sources"].append(f"skill(conf={row['confidence_score']:.0%})")
-
-    for row in alert_rows:
-        try:
-            techs = json.loads(row["techniques"] or "[]")
-        except (json.JSONDecodeError, TypeError):
-            continue
-        for tech in techs:
-            tid = tech.strip().upper()
-            if not tid:
-                continue
-            entry = scores.setdefault(tid, {"score_sum": 0.0, "count": 0, "sources": []})
-            entry["score_sum"] += float(row["confidence"] or 0) * 100
-            entry["count"]     += 1
-
-    techniques = []
-    for tid, data in scores.items():
-        avg_score = int(data["score_sum"] / max(data["count"], 1))
-        techniques.append({
-            "techniqueID":          tid,
-            "score":                avg_score,
-            "color":                "",
-            "comment":              f"Seen {data['count']}x | avg score {avg_score}",
-            "enabled":              True,
-            "metadata":             [],
-            "links":                [],
-            "showSubtechniques":    False,
-        })
-
-    layer = {
-        "name":        "NexusSoc Threat Detections",
-        "versions":    {"attack": "14", "navigator": "4.9.1", "layer": "4.5"},
-        "domain":      "enterprise-attack",
-        "description": f"Auto-generated by NexusSoc — {len(techniques)} techniques detected",
-        "filters":     {"platforms": ["Windows","Linux","macOS","Network","Cloud"]},
-        "sorting":     3,
-        "layout":      {"layout": "side", "aggregateFunction": "average", "showID": True, "showName": True},
-        "hideDisabled": False,
-        "techniques":  techniques,
-        "gradient":    {
-            "colors":   ["#ff6666ff", "#ffe766ff", "#8ec843ff"],
-            "minValue": 0,
-            "maxValue": 100,
-        },
-        "legendItems":                    [],
-        "metadata":                       [],
-        "showTacticRowBackground":        False,
-        "tacticRowBackground":            "#dddddd",
-        "selectTechniquesAcrossTactics":  True,
-        "selectSubtechniquesWithParent":  False,
-    }
-
+async def mitre_export(_user: dict = Depends(require_role("viewer"))):
     from fastapi.responses import Response
+    mitre = plugin_loader.get_export("mitre_nav")
+    if not mitre:
+        raise HTTPException(status_code=503, detail="MITRE export plugin not loaded — set PLUGIN_MITRE_EXPORT_ENABLED=true")
+    result = await mitre.export(app.state.db_pool)
     return Response(
-        content=json.dumps(layer, indent=2),
-        media_type="application/json",
-        headers={"Content-Disposition": "attachment; filename=nexussoc-navigator.json"},
+        content=result["content"],
+        media_type=result["media_type"],
+        headers={"Content-Disposition": f"attachment; filename={result['filename']}"},
+    )
+
+
+@app.get("/export/case/{case_id}/stix2")
+async def export_case_stix2(case_id: str, _user: dict = Depends(require_role("analyst"))):
+    """Download a single case as a STIX 2.1 bundle."""
+    from fastapi.responses import Response
+    stix = plugin_loader.get_export("stix2")
+    if not stix:
+        raise HTTPException(status_code=503, detail="STIX2 export plugin not loaded — set PLUGIN_STIX2_ENABLED=true")
+    result = await stix.export_case(app.state.db_pool, case_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+    return Response(
+        content=result["content"],
+        media_type=result["media_type"],
+        headers={"Content-Disposition": f"attachment; filename={result['filename']}"},
     )
 
 
 @app.get("/incidents")
-async def list_incidents(status: Optional[str] = None, limit: int = 20):
+async def list_incidents(
+    status: Optional[str] = None,
+    limit: int = 20,
+    _user: dict = Depends(require_role("viewer")),
+):
     async with app.state.db_pool.acquire() as conn:
         if status:
             rows = await conn.fetch("""
@@ -1007,7 +1054,7 @@ async def list_incidents(status: Optional[str] = None, limit: int = 20):
 
 
 @app.get("/incidents/{incident_id}")
-async def get_incident(incident_id: str):
+async def get_incident(incident_id: str, _user: dict = Depends(require_role("viewer"))):
     async with app.state.db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM soc_incidents WHERE incident_id = $1", incident_id
@@ -1018,7 +1065,11 @@ async def get_incident(incident_id: str):
 
 
 @app.patch("/incidents/{incident_id}/status")
-async def update_incident_status(incident_id: str, status: str):
+async def update_incident_status(
+    incident_id: str,
+    status: str,
+    _user: dict = Depends(require_role("analyst")),
+):
     valid = {"open", "investigating", "closed"}
     if status not in valid:
         raise HTTPException(status_code=400, detail=f"status must be one of {valid}")
@@ -1033,6 +1084,7 @@ async def update_incident_status(incident_id: str, status: str):
 
 
 class PlaybookCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     name:                   str
     description:            Optional[str]       = None
     trigger_decision:       str                 = "True Positive"
@@ -1043,7 +1095,7 @@ class PlaybookCreate(BaseModel):
 
 
 @app.get("/playbooks")
-async def list_playbooks():
+async def list_playbooks(_user: dict = Depends(require_role("viewer"))):
     async with app.state.db_pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, name, description, trigger_decision, trigger_min_confidence,
@@ -1060,7 +1112,7 @@ async def list_playbooks():
 
 
 @app.post("/playbooks", status_code=201)
-async def create_playbook(pb: PlaybookCreate):
+async def create_playbook(pb: PlaybookCreate, _user: dict = Depends(require_role("admin"))):
     async with app.state.db_pool.acquire() as conn:
         row = await conn.fetchrow("""
             INSERT INTO soc_playbooks
@@ -1076,7 +1128,7 @@ async def create_playbook(pb: PlaybookCreate):
 
 
 @app.delete("/playbooks/{playbook_id}")
-async def delete_playbook(playbook_id: int):
+async def delete_playbook(playbook_id: int, _user: dict = Depends(require_role("admin"))):
     async with app.state.db_pool.acquire() as conn:
         r = await conn.execute("DELETE FROM soc_playbooks WHERE id = $1", playbook_id)
     if r == "DELETE 0":
@@ -1085,7 +1137,7 @@ async def delete_playbook(playbook_id: int):
 
 
 @app.get("/playbooks/executions")
-async def list_executions(limit: int = 20):
+async def list_executions(limit: int = 20, _user: dict = Depends(require_role("viewer"))):
     async with app.state.db_pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, executed_at, case_id, playbook_name, actions_taken
@@ -1101,6 +1153,93 @@ async def list_executions(limit: int = 20):
     return {"total": len(executions), "executions": executions}
 
 
+@app.get("/admin/audit-logs")
+async def list_audit_logs(
+    limit: int = 50,
+    offset: int = 0,
+    _user: dict = Depends(require_role("admin")),
+):
+    """Paginated audit log — admin only."""
+    async with app.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, created_at, user_id, username, method, endpoint,
+                   status_code, duration_ms, client_ip
+            FROM audit_logs
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            """,
+            limit, offset,
+        )
+        total = await conn.fetchval("SELECT COUNT(*) FROM audit_logs")
+    return {"total": total, "limit": limit, "offset": offset, "logs": [dict(r) for r in rows]}
+
+
+# ── SIEM CONNECTORS ───────────────────────────────────────────────────────────
+
+@app.get("/connectors")
+async def list_connectors(_user: dict = Depends(require_role("viewer"))):
+    """List all registered SIEM connector names."""
+    return {"connectors": list(CONNECTOR_REGISTRY.keys())}
+
+
+@app.post("/ingest/{connector_name}", status_code=202)
+async def ingest_via_connector(
+    connector_name: str,
+    raw: dict,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    _user: dict = Depends(require_role("analyst")),
+):
+    """Normalize a raw SIEM payload and queue it for analysis.
+
+    connector_name: one of wazuh | elastic | splunk | qradar | generic
+    """
+    connector = CONNECTOR_REGISTRY.get(connector_name)
+    if not connector:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown connector '{connector_name}'. Available: {list(CONNECTOR_REGISTRY.keys())}",
+        )
+
+    try:
+        normalized = connector.normalize(raw)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=f"Normalization error: {exc}") from exc
+
+    try:
+        alert = SecurityAlert.model_validate(normalized)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Schema validation error: {exc}") from exc
+
+    rc = request.app.state.redis
+    if not rc:
+        raise HTTPException(status_code=503, detail="Queue unavailable — REDIS_URL not configured")
+
+    job_id  = str(uuid.uuid4())
+    payload = json.loads(alert.model_dump_json())
+    payload["_job_id"]    = job_id
+    payload["_connector"] = connector_name
+    payload["timestamp"]  = payload.get("timestamp") or datetime.now(timezone.utc).isoformat()
+
+    await rc.hset(f"{JOB_PREFIX}{job_id}", mapping={
+        "status":     "queued",
+        "case_id":    alert.sourceRef,
+        "connector":  connector_name,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    await rc.expire(f"{JOB_PREFIX}{job_id}", JOB_TTL)
+    await rc.lpush(QUEUE_KEY, json.dumps(payload, default=str))
+
+    logger.info("Ingest job=%s connector=%s case=%s", job_id, connector_name, alert.sourceRef)
+    return {
+        "job_id":    job_id,
+        "case_id":   alert.sourceRef,
+        "connector": connector_name,
+        "status":    "queued",
+    }
+
+
 @app.get("/")
 async def root():
     return {
@@ -1108,12 +1247,14 @@ async def root():
         "version": "2.0.0",
         "features": ["pgvector memory", "skill learning", "EMA feedback", "MITRE context"],
         "endpoints": {
-            "POST /analyze-case":      "Analyze a security alert",
-            "POST /feedback/{id}":     "Analyst feedback → updates skill confidence",
-            "GET  /skills":            "View all learned skills",
-            "DELETE /skills/{id}":     "Remove a skill",
-            "GET  /memory":            "View past case memories",
-            "GET  /health":            "Health + stats",
-            "GET  /docs":              "Swagger UI"
+            "POST /analyze-case":           "Analyze a security alert",
+            "POST /feedback/{id}":          "Analyst feedback → updates skill confidence",
+            "GET  /skills":                 "View all learned skills",
+            "DELETE /skills/{id}":          "Remove a skill",
+            "GET  /memory":                 "View past case memories",
+            "GET  /health":                 "Health + stats",
+            "GET  /connectors":             "List SIEM connectors",
+            "POST /ingest/{connector}":     "Normalize + queue via SIEM connector",
+            "GET  /docs":                   "Swagger UI"
         }
     }

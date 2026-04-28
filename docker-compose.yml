@@ -1,5 +1,5 @@
 services:
- 
+
   ai-db:
     image: pgvector/pgvector:pg15
     container_name: ai-soc-db
@@ -16,6 +16,25 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - backend
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: nexussoc_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./grafana/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+    depends_on:
+      - ai-agent-api
+    networks:
+      - backend
 
   grafana:
     image: grafana/grafana-oss:latest
@@ -26,9 +45,15 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${DB_PASS}
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioned-dashboards:ro
     depends_on:
       ai-db:
         condition: service_healthy
+      prometheus:
+        condition: service_started
+    networks:
+      - backend
 
   redis:
     image: redis:7-alpine
@@ -40,6 +65,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - backend
 
   ai-agent-api:
     build: ./ai_agent_src
@@ -52,11 +79,20 @@ services:
       - "8001:8000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/health',timeout=5); d=__import__('json').loads(r.read()); sys.exit(0 if d['status'] in ('healthy','degraded') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     depends_on:
       ai-db:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      - backend
+      - frontend
 
   worker:
     build: ./ai_agent_src
@@ -68,11 +104,19 @@ services:
       - WORKER_API_URL=http://ai-agent-api:8000
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import redis,time,sys; r=redis.Redis.from_url('redis://redis:6379'); v=r.get('nexussoc:worker:heartbeat'); sys.exit(0 if v and time.time()-float(v)<90 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
     depends_on:
       redis:
         condition: service_healthy
       ai-agent-api:
-        condition: service_started
+        condition: service_healthy
+    networks:
+      - backend
 
   soc-frontend:
     build:
@@ -87,7 +131,16 @@ services:
       - CHOKIDAR_USEPOLLING=true
     depends_on:
       - ai-agent-api
+    networks:
+      - frontend
 
 volumes:
   postgres_data:
   grafana_data:
+  prometheus_data:
+
+networks:
+  backend:
+    driver: bridge
+  frontend:
+    driver: bridge

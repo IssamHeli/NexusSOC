@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint & Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dev deps
+        run: |
+          pip install --quiet \
+            ruff \
+            bandit \
+            mypy \
+            -r ai_agent_src/requirements.txt
+
+      - name: Ruff lint
+        run: ruff check ai_agent_src/
+
+      - name: Bandit security scan
+        run: |
+          bandit -r ai_agent_src/ \
+            --exclude ai_agent_src/migrations \
+            -ll -q
+
+      - name: mypy type-check
+        run: |
+          mypy ai_agent_src/ \
+            --ignore-missing-imports \
+            --no-strict-optional \
+            --exclude ai_agent_src/migrations
+
+  test:
+    name: Pytest
+    runs-on: ubuntu-latest
+    needs: lint
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_USER: soc
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: soc_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U soc"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DB_USER: soc
+      DB_PASS: testpass
+      DB_NAME: soc_test
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      REDIS_URL: redis://localhost:6379
+      OLLAMA_HOST: localhost
+      JWT_SECRET: ci-test-secret-not-for-prod
+      AUTH_ENABLED: "false"
+      PLAYBOOK_DRY_RUN: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install --quiet -r ai_agent_src/requirements.txt pytest pytest-asyncio
+
+      - name: Run tests
+        working-directory: ai_agent_src
+        run: |
+          if [ -d tests ]; then
+            pytest tests/ -v --tb=short
+          else
+            echo "No tests directory yet — skipping"
+          fi

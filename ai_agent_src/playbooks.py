@@ -1,8 +1,15 @@
 import os
+import re
 import logging
 import json
 from datetime import datetime, timezone
 import httpx
+from security import is_safe_webhook_url
+
+
+def _safe_format(template: str, ctx: dict) -> str:
+    """Replace {key} placeholders without breaking JSON structural braces."""
+    return re.sub(r'\{(\w+)\}', lambda m: ctx.get(m.group(1), m.group(0)), template)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +32,8 @@ async def _run_action(action: dict, context: dict, client: httpx.AsyncClient) ->
         url = action.get("url") or context.get("discord_url", "")
         if not url:
             return {"type": "discord", "status": "skipped", "detail": "no webhook url"}
+        if not is_safe_webhook_url(url):
+            return {"type": "discord", "status": "blocked", "detail": "SSRF: unsafe url"}
         msg = action.get("message", "Playbook triggered for {case_id}").format(**context)
         try:
             r = await client.post(url, json={"content": msg}, timeout=8.0)
@@ -36,10 +45,12 @@ async def _run_action(action: dict, context: dict, client: httpx.AsyncClient) ->
         url = action.get("url", "")
         if not url:
             return {"type": "webhook", "status": "skipped", "detail": "no url"}
+        if not is_safe_webhook_url(url):
+            return {"type": "webhook", "status": "blocked", "detail": "SSRF: unsafe url"}
         method   = action.get("method", "POST").upper()
         payload  = action.get("payload", {})
         safe_ctx = {k: str(v) for k, v in context.items()}
-        resolved = json.loads(json.dumps(payload).format(**safe_ctx))
+        resolved = json.loads(_safe_format(json.dumps(payload), safe_ctx))
 
         if DRY_RUN:
             detail = f"[DRY-RUN] would {method} {url} payload={json.dumps(resolved)[:120]}"

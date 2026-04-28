@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_API: ghcr.io/${{ github.repository_owner }}/nexussoc-api
+  IMAGE_WORKER: ghcr.io/${{ github.repository_owner }}/nexussoc-worker
+
+jobs:
+  release:
+    name: Build & Push Docker images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract tag version
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./ai_agent_src
+          push: true
+          tags: |
+            ${{ env.IMAGE_API }}:${{ steps.meta.outputs.version }}
+            ${{ env.IMAGE_API }}:latest
+
+      - name: Build & push Worker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./ai_agent_src
+          push: true
+          tags: |
+            ${{ env.IMAGE_WORKER }}:${{ steps.meta.outputs.version }}
+            ${{ env.IMAGE_WORKER }}:latest
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## NexusSOC ${{ steps.meta.outputs.version }}
+
+            Docker images published to GHCR:
+            ```
+            docker pull ${{ env.IMAGE_API }}:${{ steps.meta.outputs.version }}
+            docker pull ${{ env.IMAGE_WORKER }}:${{ steps.meta.outputs.version }}
+            ```
+
+            **Quick start:**
+            ```bash
+            cp .env.example .env  # fill in secrets
+            make up
+            ```
