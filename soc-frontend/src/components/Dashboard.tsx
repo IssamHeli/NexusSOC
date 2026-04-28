@@ -1,6 +1,106 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../lib/api'
-import type { HealthStatus, Memory } from '../types'
+import type {
+  HealthStatus, Memory,
+  WorkerHealth, PluginsHealth, ConnectorsHealth,
+} from '../types'
+
+type SvcStatus = 'ok' | 'down' | 'degraded' | 'disabled' | 'stale' | 'unknown'
+
+function statusColor(s: SvcStatus) {
+  if (s === 'ok')                          return 'var(--green)'
+  if (s === 'degraded' || s === 'stale')   return 'var(--amber)'
+  if (s === 'disabled' || s === 'unknown') return 'var(--text-3)'
+  return 'var(--red)'
+}
+function statusBg(s: SvcStatus) {
+  if (s === 'ok')                          return 'rgba(0,230,118,.08)'
+  if (s === 'degraded' || s === 'stale')   return 'rgba(255,179,0,.08)'
+  if (s === 'disabled' || s === 'unknown') return 'rgba(255,255,255,.04)'
+  return 'rgba(255,61,87,.08)'
+}
+
+function ServicePill({ label, status, sub, latencyMs }: {
+  label: string; status: SvcStatus; sub?: string; latencyMs?: number | null
+}) {
+  const color = statusColor(status)
+  const bg    = statusBg(status)
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 6,
+      padding: '5px 12px', borderRadius: 6, border: `1px solid ${color}33`,
+      background: bg, fontSize: 12, fontFamily: 'var(--mono)',
+    }}>
+      <span style={{
+        width: 7, height: 7, borderRadius: '50%', background: color, flexShrink: 0,
+        boxShadow: status === 'ok' ? `0 0 5px ${color}` : 'none',
+      }} />
+      <span style={{ color: 'var(--text-2)' }}>{label}</span>
+      <span style={{ color, marginLeft: 2 }}>{status.toUpperCase()}</span>
+      {latencyMs != null && (
+        <span style={{ color: 'var(--text-3)', fontSize: 10 }}>{latencyMs}ms</span>
+      )}
+      {sub && <span style={{ color: 'var(--text-3)', marginLeft: 2, fontSize: 11 }}>· {sub}</span>}
+    </div>
+  )
+}
+
+function WorkerPill({ worker }: { worker: WorkerHealth }) {
+  const color = statusColor(worker.status as SvcStatus)
+  const bg    = statusBg(worker.status as SvcStatus)
+  const sub   = worker.last_heartbeat_s != null ? `hb ${worker.last_heartbeat_s}s ago` : undefined
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 6,
+      padding: '5px 12px', borderRadius: 6, border: `1px solid ${color}33`,
+      background: bg, fontSize: 12, fontFamily: 'var(--mono)',
+    }}>
+      <span style={{
+        width: 7, height: 7, borderRadius: '50%', background: color, flexShrink: 0,
+        boxShadow: worker.status === 'ok' ? `0 0 5px ${color}` : 'none',
+      }} />
+      <span style={{ color: 'var(--text-2)' }}>worker</span>
+      <span style={{ color }}>{worker.status.toUpperCase()}</span>
+      {sub && <span style={{ color: 'var(--text-3)', fontSize: 10 }}>· {sub}</span>}
+    </div>
+  )
+}
+
+function PluginPill({ plugins }: { plugins: PluginsHealth }) {
+  const s     = plugins.status === 'ok' ? 'ok' : plugins.status === 'partial' ? 'degraded' : 'disabled' as SvcStatus
+  const color = statusColor(s)
+  const bg    = statusBg(s)
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 6,
+      padding: '5px 12px', borderRadius: 6, border: `1px solid ${color}33`,
+      background: bg, fontSize: 12, fontFamily: 'var(--mono)',
+    }}>
+      <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, flexShrink: 0 }} />
+      <span style={{ color: 'var(--text-2)' }}>plugins</span>
+      <span style={{ color }}>{plugins.loaded}/{plugins.total}</span>
+    </div>
+  )
+}
+
+function ConnectorsPill({ connectors }: { connectors: ConnectorsHealth }) {
+  const color = connectors.registered > 0 ? 'var(--cyan)' : 'var(--text-3)'
+  const bg    = connectors.registered > 0 ? 'rgba(0,229,255,.08)' : 'rgba(255,255,255,.04)'
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 6,
+      padding: '5px 12px', borderRadius: 6, border: `1px solid ${color}33`,
+      background: bg, fontSize: 12, fontFamily: 'var(--mono)',
+    }}>
+      <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, flexShrink: 0 }} />
+      <span style={{ color: 'var(--text-2)' }}>connectors</span>
+      <span style={{ color }}>{connectors.registered}</span>
+      {connectors.names.length > 0 && (
+        <span style={{ color: 'var(--text-3)', fontSize: 10 }}>· {connectors.names.join(' · ')}</span>
+      )}
+    </div>
+  )
+}
 
 export function Dashboard() {
   const [health,        setHealth]        = useState<HealthStatus | null>(null)
@@ -73,7 +173,7 @@ export function Dashboard() {
               <span className="stat-value" style={{ fontSize: 18, color: health?.status === 'healthy' ? 'var(--green)' : 'var(--red)' }}>
                 {health?.status === 'healthy' ? 'ONLINE' : 'OFFLINE'}
               </span>
-              <span className="stat-sub">{health?.database === 'connected' ? 'DB connected' : 'DB disconnected'}</span>
+              <span className="stat-sub">{health?.database === 'ok' ? 'DB connected' : 'DB disconnected'}</span>
             </div>
 
             <div className="stat-card accent-green">
@@ -110,6 +210,35 @@ export function Dashboard() {
               <span className="stat-sub">{health?.embed_model ?? '—'}</span>
             </div>
           </div>
+
+          {health?.services && (
+            <div className="card" style={{ marginBottom: 16 }}>
+              <p className="card-title" style={{ marginBottom: 10 }}>Service Status</p>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                <ServicePill
+                  label="database"
+                  status={health.services.database.status}
+                  latencyMs={health.services.database.latency_ms}
+                  sub={health.services.database.pgvector ? 'pgvector ✓' : 'pgvector ✗'}
+                />
+                <ServicePill
+                  label="redis"
+                  status={health.services.redis.status}
+                  latencyMs={health.services.redis.latency_ms}
+                  sub={`q:${health.services.redis.queue_depth} dlq:${health.services.redis.dlq_depth}`}
+                />
+                <ServicePill
+                  label="ollama"
+                  status={health.services.ollama.status}
+                  latencyMs={health.services.ollama.latency_ms}
+                  sub={health.services.ollama.active_model ?? `${health.ollama_model} (on-demand)`}
+                />
+                <WorkerPill     worker={health.services.worker} />
+                <PluginPill     plugins={health.services.plugins} />
+                <ConnectorsPill connectors={health.services.connectors} />
+              </div>
+            </div>
+          )}
 
           <div className="card">
             <p className="card-title">Recent Cases</p>

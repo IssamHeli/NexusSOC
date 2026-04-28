@@ -1,11 +1,59 @@
+export interface DbHealth {
+  status:       'ok' | 'down'
+  latency_ms:   number | null
+  pgvector:     boolean
+  skill_count:  number
+  memory_count: number
+}
+
+export interface RedisHealth {
+  status:      'ok' | 'down' | 'disabled'
+  latency_ms:  number | null
+  queue_depth: number
+  dlq_depth:   number
+}
+
+export interface OllamaHealth {
+  status:           'ok' | 'down' | 'degraded'
+  latency_ms:       number | null
+  active_model:     string | null
+  available_models: string[]
+}
+
+export interface WorkerHealth {
+  status:           'ok' | 'stale' | 'unknown'
+  last_heartbeat_s: number | null
+}
+
+export interface PluginsHealth {
+  status: 'ok' | 'partial' | 'none'
+  loaded: number
+  total:  number
+}
+
+export interface ConnectorsHealth {
+  registered: number
+  names:      string[]
+}
+
+export interface ServiceHealth {
+  database:   DbHealth
+  redis:      RedisHealth
+  ollama:     OllamaHealth
+  worker:     WorkerHealth
+  plugins:    PluginsHealth
+  connectors: ConnectorsHealth
+}
+
 export interface HealthStatus {
-  status: string
-  database: string
-  ollama_model: string
-  embed_model: string
-  skills_learned: number
+  status:           string
+  services?:        ServiceHealth
+  database:         string
+  ollama_model:     string
+  embed_model:      string
+  skills_learned:   number
   memories_indexed: number
-  playbook_mode: string
+  playbook_mode:    string
 }
 
 export interface AnalysisResult {
@@ -107,4 +155,30 @@ export interface PlaybookExecution {
   actions_taken: ActionOutcome[]
 }
 
-export type TabId = 'dashboard' | 'skills' | 'memory' | 'simulation' | 'incidents' | 'playbooks'
+export interface User {
+  id:         number
+  username:   string
+  role:       'viewer' | 'analyst' | 'admin'
+  is_active:  boolean
+  created_at: string
+}
+
+export interface AuditLog {
+  id:          number
+  timestamp:   string
+  method:      string
+  path:        string
+  status:      number
+  ip:          string
+  username:    string | null
+  duration_ms: number
+}
+
+export interface PluginStatus {
+  name:     string
+  category: 'notification' | 'enrichment' | 'export'
+  loaded:   boolean
+  reason:   string
+}
+
+export type TabId = 'dashboard' | 'skills' | 'memory' | 'simulation' | 'incidents' | 'playbooks' | 'audit' | 'users' | 'plugins' | 'connectors' | 'dlq'

@@ -69,6 +69,17 @@ function MemoryDetail({
             {new Date(memory.timestamp).toLocaleString()} · embedding {memory.has_embedding ? '● indexed' : '○ missing'}
           </div>
         </div>
+        <button
+          className="btn btn-ghost"
+          style={{ padding: '6px 14px', fontSize: 12 }}
+          title="Download STIX 2.1 bundle"
+          onClick={async () => {
+            try { await api.exportCaseStix(memory.case_id) }
+            catch (e) { alert(e instanceof Error ? e.message : 'Export failed') }
+          }}
+        >
+          📤 Export STIX 2.1
+        </button>
       </div>
 
       {/* Stats grid */}
