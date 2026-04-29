@@ -1,231 +1,189 @@
-# NexusSOC — AI-Powered SOC Analyst Agent
+# NexusSOC — Backend (`ai_agent_src/`)
 
-An autonomous Security Operations Center analyst that triages alerts, learns from analyst feedback, correlates incidents, and executes response playbooks — all running locally with no cloud LLM dependency.
+FastAPI service that triages security alerts with a multi-LLM router, stores cases as pgvector embeddings, executes response playbooks, and exposes everything through a JWT/RBAC-protected API.
 
-## Overview
+> Root `README.md` covers the full platform (frontend, Grafana, screenshots, quick start). This document is the backend-only reference.
 
-NexusSOC receives security alerts from any source (SIEM, EDR, IDS, TheHive), analyzes them with a local LLM, groups related alerts into incidents, and automatically triggers response playbooks. Every decision is stored as a vector embedding, giving the agent a persistent memory that improves accuracy over time.
+---
+
+## Architecture
 
 ```
-Alert Source (SIEM / TheHive / manual)
-        │
-        ▼
-POST /ingest ──► Redis Queue ──► Worker
-                                    │
-                      ┌─────────────┼──────────────┐
-                      ▼             ▼              ▼
-                  Embedding     Memory          Skills
-                  (Ollama)    (pgvector)      (pgvector)
-                      │             │              │
-                      └─────────────┴──────────────┘
-                                    │
-                                    ▼
-                            Local LLM (Ollama)
-                                    │
-                          ┌─────────┴─────────┐
-                          ▼                   ▼
-                      Correlator         Playbook Executor
-                    (incidents)       (Discord / Webhook)
-                          │                   │
-                          ▼                   ▼
-                      PostgreSQL           Notifications
+SIEM webhook ─► POST /ingest/{connector}
+                        │ normalize → SecurityAlert
+                        ▼
+                  Redis queue ──► Worker ──► retry (2/4/8 s) ──► DLQ on 3rd fail
+                        │
+                        ▼
+            ┌──────────────────────────┐
+            │  /analyze-case (sync)    │
+            │   or worker (async)      │
+            │                          │
+            │  ┌────────────────────┐  │
+            │  │   LLM Router       │  │
+            │  │ primary + fallback │  │
+            │  │ Ollama / OpenAI /  │  │
+            │  │ Anthropic          │  │
+            │  └─────────┬──────────┘  │
+            │            ▼             │
+            │   pgvector memory        │
+            │   skills (EMA α=0.15)    │
+            │   correlator → incidents │
+            │   playbooks → notif      │
+            └──────────────────────────┘
+                        │
+                        ▼
+                Discord / Slack / Teams · STIX 2.1 · MITRE Navigator
 ```
 
-## Features
+Embeddings stay pinned to Ollama (`nomic-embed-text`). Changing the embed model invalidates every stored vector — pick once, keep forever.
 
-### Alert Analysis
-- Classifies alerts as **True Positive** or **False Positive** with a calibrated confidence score
-- Enrichment-aware: reads pre-computed **AbuseIPDB** and **VirusTotal** scores from the alert payload
-- Evidence-based confidence ceiling — score is capped based on available context (no enrichment = max 0.74, missing one source = max 0.88)
-- Supports rich alert schema: network IOCs, file hashes, YARA rules, AV detections, C2 infrastructure, data exfiltration details, privilege escalation chains, Sigma rules, kill chain phase, MITRE ATT&CK techniques
+---
 
-### Memory & Self-Learning
-- Every analyzed case is embedded (768-dim via `nomic-embed-text`) and stored in PostgreSQL with **pgvector**
-- Similar past cases are retrieved at analysis time via cosine similarity (threshold ≥ 0.72)
-- Analyst feedback via `POST /feedback/{case_id}` updates skill confidence using **EMA** (Exponential Moving Average)
-- Skills with confidence ≥ 0.85 are automatically extracted and reused in future analyses
+## Modules
 
-### Incident Correlation
-- Groups related alerts into incidents by shared: source IP, hostname, user, file hash, or explicit `correlated_cases` field
-- Tracks kill chain progression and MITRE techniques per incident
-- Incident lifecycle: `open` → `investigating` → `closed`
-
-### Automated Playbooks
-8 default playbooks included (seeded via `seed_playbooks.py`):
-
-| Playbook | Trigger |
+| File | Role |
 |---|---|
-| Brute Force — Block & Notify | brute_force, conf ≥ 0.80 |
-| Data Exfiltration — Isolate & Escalate | data_exfiltration, conf ≥ 0.85 |
-| Malware — Quarantine Endpoint | malware, conf ≥ 0.85 |
-| Privilege Escalation — Lock Account | privilege_escalation, conf ≥ 0.88 |
-| Lateral Movement — Network Isolation | lateral_movement, conf ≥ 0.85 |
-| Reconnaissance — Log & Monitor | reconnaissance, conf ≥ 0.75 |
-| Denial of Service — Rate-Limit & NOC Alert | denial_of_service, conf ≥ 0.80 |
-| High-Confidence Unknown — Generic Escalation | unknown, conf ≥ 0.90 |
+| `main.py` | FastAPI app, all endpoints, prompt build, embedding/skill flow |
+| `auth.py` | JWT (access + refresh), bcrypt hashing, `require_role`, `/auth/*` + `/users/*` routers, `seed_admin` |
+| `security.py` | Middlewares: SecurityHeaders, RequestSize 1 MB, RateLimit (Redis sliding window), AuditLog. Helpers: `sanitize_str`, `is_safe_webhook_url` (SSRF guard) |
+| `worker.py` | Standalone Redis worker. `MAX_RETRIES=3`, exponential backoff, DLQ `nexussoc:dlq`, heartbeat key `nexussoc:worker:heartbeat` |
+| `playbooks.py` | Playbook engine. `_safe_format` regex avoids JSON-brace `KeyError` |
+| `correlator.py` | Groups related alerts into incidents by shared indicators |
+| `llm/{base,ollama,openai,anthropic,router}.py` | LLM abstraction. Router walks `LLM_FALLBACK_CHAIN` on `LLMError` |
+| `connectors/{wazuh,elastic,splunk,qradar,generic}.py` | Normalize raw SIEM payloads → `SecurityAlert`. `CONNECTOR_REGISTRY` exposes them |
+| `plugins/loader.py` | Hard-coded whitelist registry. `PLUGIN_*_ENABLED` env toggles |
+| `plugins/notification/*` | Discord, Slack, Teams webhook senders |
+| `plugins/enrichment/*` | VirusTotal, AbuseIPDB (passive stubs — extend via `EnrichmentPlugin`) |
+| `plugins/export/*` | MITRE ATT&CK Navigator layer JSON, STIX 2.1 bundle |
+| `migrations/versions/0001_initial_schema.py` | Alembic async migrations — runs in Docker `CMD` before uvicorn |
+| `shuffle_simulation.py` | End-to-end SOAR pipeline simulation (16 scenarios) |
+| `seed_playbooks.py` | Loads 8 default response playbooks |
 
-Playbook action types: `log`, `discord`, `webhook`. Set `PLAYBOOK_DRY_RUN=true` to test without executing real webhooks.
+---
 
-### MITRE ATT&CK Export
-`GET /mitre/export` generates a ready-to-import **Navigator layer JSON** aggregating all detected techniques from learned skills and analyzed cases, color-coded by frequency and confidence.
+## API surface (versioned in `main.py`)
 
-### Async Queue
-`POST /ingest` is non-blocking — pushes to Redis and returns a `job_id` immediately. The worker processes jobs in the background. Poll status with `GET /jobs/{job_id}`.
+All endpoints require JWT and a minimum role (`viewer < analyst < admin`) when `AUTH_ENABLED=true`.
 
-## Tech Stack
-
-| Component | Technology |
-|---|---|
-| API | FastAPI + Uvicorn |
-| Database | PostgreSQL + pgvector (HNSW index) |
-| Queue | Redis |
-| LLM inference | Ollama (`qwen3:1.7b` default) |
-| Embeddings | Ollama (`nomic-embed-text`, 768 dim) |
-| Notifications | Discord webhooks |
-| Container | Docker |
-
-## Requirements
-
-- Docker & Docker Compose
-- [Ollama](https://ollama.ai) running locally with the following models pulled:
-  ```bash
-  ollama pull qwen3:1.7b
-  ollama pull nomic-embed-text
-  ```
-
-## Choosing a Model for Your Hardware
-
-NexusSOC runs entirely locally — no cloud API needed. The LLM model is fully configurable via the `OLLAMA_MODEL` environment variable. Pick the model that fits your hardware:
-
-| RAM / VRAM | Recommended Model | Notes |
+### Auth
+| Method | Path | Notes |
 |---|---|---|
-| 4 GB | `qwen3:1.7b` *(default)* | Fast, low resource, good for basic triage |
-| 8 GB | `mistral:7b` or `llama3.1:8b` | Better reasoning, more accurate analysis |
-| 16 GB | `qwen3:14b` or `mistral-nemo:12b` | Strong accuracy, handles complex alerts well |
-| 24 GB+ | `qwen3:32b` or `llama3.1:70b` (quantized) | Near-professional SOC analyst quality |
+| `POST` | `/auth/login` | Returns access + refresh token. Rate limited 5/min |
+| `POST` | `/auth/refresh` | Rotates refresh token |
+| `POST` | `/auth/logout` | Revokes JTI in Redis |
+| `GET` | `/auth/me` | Current user info |
 
-To switch model, pull it with Ollama then set the env var:
-```bash
-ollama pull mistral:7b
-```
-```env
-OLLAMA_MODEL=mistral:7b
-```
+### User management (admin)
+| Method | Path |
+|---|---|
+| `GET` `POST` | `/users` |
+| `PATCH` | `/users/{username}/role` |
+| `PATCH` | `/users/{username}/password` |
+| `DELETE` | `/users/{username}` |
 
-> **Note:** The embedding model (`nomic-embed-text`) must stay fixed — changing it invalidates all stored vector embeddings in the database and breaks memory/skill retrieval. Only change it on a fresh install.
+Guards: no self-demote, no self-delete, no last-admin-delete.
 
-## Quick Start
-
-**1. Clone and configure**
-```bash
-git clone <repo-url>
-cd SocAnalyst_Ai_Agent
-cp ai_agent_src/.env.example .env   # edit with your values
-```
-
-**2. Environment variables**
-
-| Variable | Required | Default | Description |
+### Ingestion
+| Method | Path | Role | Notes |
 |---|---|---|---|
-| `DB_HOST` | yes | — | PostgreSQL host |
-| `DB_USER` | yes | — | PostgreSQL user |
-| `DB_PASS` | yes | — | PostgreSQL password |
-| `DB_NAME` | yes | — | PostgreSQL database name |
-| `DB_PORT` | no | `5432` | PostgreSQL port |
-| `REDIS_URL` | no | — | Redis URL (disables async ingest if unset) |
-| `OLLAMA_HOST` | no | `host.docker.internal` | Ollama host |
-| `OLLAMA_PORT` | no | `11434` | Ollama port |
-| `OLLAMA_MODEL` | no | `qwen3:1.7b` | LLM model name |
-| `EMBED_MODEL` | no | `nomic-embed-text` | Embedding model name |
-| `DISCORD_WEBHOOK` | no | — | Discord webhook URL for alerts |
-| `PLAYBOOK_DRY_RUN` | no | `true` | Set to `false` to execute real webhooks |
+| `POST` | `/ingest` | analyst | Async — pre-normalized payload, returns `job_id` |
+| `POST` | `/ingest/{connector_name}` | analyst | Webhook ingress per SIEM. 404/422/202 |
+| `POST` | `/ingest/batch` | analyst | Bulk JSON. Optional `connector_name`, auto-detect when omitted. Cap `BATCH_MAX_ALERTS` (default 100) → 413; empty array → 422 |
+| `GET` | `/jobs/{job_id}` | analyst | Poll status |
+| `GET` | `/connectors` | viewer | Names list |
 
-**3. Start the full stack**
-
-The `docker-compose.yml` lives in the project root and wires up all services:
-
-```bash
-docker compose up --build
-```
-
-This starts:
-| Service | URL |
-|---|---|
-| AI Agent API | http://localhost:8001 |
-| API Docs (Swagger) | http://localhost:8001/docs |
-| SOC Frontend | http://localhost:5173 |
-| Grafana | http://localhost:3000 |
-| PostgreSQL | localhost:5432 |
-| Redis | localhost:6379 |
-
-**4. Seed default playbooks**
-```bash
-python ai_agent_src/seed_playbooks.py http://localhost:8001
-```
-
-## API Reference
-
-### Alert Ingestion
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/ingest` | Queue alert for async analysis (returns `job_id`) |
-| `POST` | `/analyze-case` | Synchronous analysis |
-| `GET` | `/jobs/{job_id}` | Poll async job status and result |
-| `GET` | `/queue/depth` | Number of alerts waiting in queue |
-
-### Analysis & Feedback
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/feedback/{case_id}` | Submit analyst verdict (correct/incorrect) — updates skill confidence |
-| `GET` | `/memory` | View recent analyzed cases |
+### Analysis
+| Method | Path | Role | Notes |
+|---|---|---|---|
+| `POST` | `/analyze-case` | analyst | Sync. 503 on `LLMError` (router exhausted) |
+| `POST` | `/feedback/{case_id}` | analyst | Updates skill confidence via EMA (α=0.15) |
+| `GET` | `/memory` | viewer | Recent analyzed cases |
 
 ### Skills
-
-| Method | Endpoint | Description |
+| Method | Path | Role |
 |---|---|---|
-| `GET` | `/skills` | List learned skills (filter by `min_confidence`) |
-| `POST` | `/skills/{id}/feedback` | Rate a skill directly — updates confidence via EMA (α=0.15) |
-| `DELETE` | `/skills/{id}` | Remove a bad or irrelevant skill |
-
-`POST /skills/{id}/feedback` body:
-```json
-{ "correct": true, "analyst_note": "optional note" }
-```
-Returns `confidence_before` and `confidence_after` so the UI can update in real time.
+| `GET` | `/skills` | viewer |
+| `POST` | `/skills/{id}/feedback` | analyst |
+| `DELETE` | `/skills/{id}` | admin |
 
 ### Incidents
-
-| Method | Endpoint | Description |
+| Method | Path | Role |
 |---|---|---|
-| `GET` | `/incidents` | List incidents (filter by `status`) |
-| `GET` | `/incidents/{id}` | Incident detail |
-| `PATCH` | `/incidents/{id}/status` | Update status: `open` / `investigating` / `closed` |
+| `GET` | `/incidents` | viewer |
+| `GET` | `/incidents/{id}` | viewer |
+| `PATCH` | `/incidents/{id}/status` | analyst |
 
 ### Playbooks
-
-| Method | Endpoint | Description |
+| Method | Path | Role |
 |---|---|---|
-| `GET` | `/playbooks` | List all playbooks |
-| `POST` | `/playbooks` | Create a playbook |
-| `DELETE` | `/playbooks/{id}` | Delete a playbook |
-| `GET` | `/playbooks/executions` | Execution audit log |
+| `GET` `POST` `DELETE` | `/playbooks{,/{id}}` | viewer / admin / admin |
+| `GET` | `/playbooks/executions` | viewer |
 
-### System
-
-| Method | Endpoint | Description |
+### Queue + DLQ
+| Method | Path | Role |
 |---|---|---|
-| `GET` | `/health` | DB status, model names, skill/memory counts, playbook mode |
-| `GET` | `/mitre/export` | Download MITRE ATT&CK Navigator layer JSON |
+| `GET` | `/queue/depth` | viewer |
+| `GET` | `/queue/dlq` | admin |
+| `POST` | `/queue/dlq/clear` | admin |
+| `POST` | `/queue/dlq/requeue-all` | admin |
 
-## Example Alert Payload
+### Plugins, exports, audit, system
+| Method | Path | Role |
+|---|---|---|
+| `GET` | `/plugins` | viewer |
+| `GET` | `/mitre/export` | viewer |
+| `GET` | `/export/case/{case_id}/stix2` | analyst |
+| `GET` | `/admin/audit-logs` | admin |
+| `GET` | `/health` | open — per-dependency `{status, latency_ms}` for db / redis / ollama / worker / plugins / connectors / llm |
+| `GET` | `/metrics` | open — Prometheus instrumentator + custom metrics |
+
+Custom Prometheus metrics: `nexussoc_alerts_total{decision,source}`, `nexussoc_analysis_duration_seconds`, `nexussoc_confidence_score`, `nexussoc_queue_depth`.
+
+---
+
+## Configuration
+
+All config is environment-driven. See `.env.example` for the full template.
+
+| Section | Variables |
+|---|---|
+| Database | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME` |
+| Redis | `REDIS_URL` |
+| LLM router | `LLM_BACKEND`, `LLM_FALLBACK_CHAIN` |
+| Ollama | `OLLAMA_HOST`, `OLLAMA_PORT`, `OLLAMA_MODEL`, `EMBED_MODEL` |
+| OpenAI | `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL` |
+| Anthropic | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_MAX_TOKENS` |
+| Auth | `AUTH_ENABLED`, `JWT_SECRET` (≥32 chars when auth on), `ACCESS_TOKEN_EXPIRE_MINUTES`, `REFRESH_TOKEN_EXPIRE_DAYS`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `API_KEY` |
+| CORS / HTTPS | `CORS_ORIGINS`, `HTTPS_ONLY` |
+| Plugins | `PLUGIN_*_ENABLED` (Discord, Slack, Teams, VT, AbuseIPDB, MITRE, STIX2) plus `*_WEBHOOK` / `*_API_KEY` companions |
+| Batch ingest | `BATCH_MAX_ALERTS` (default `100`) |
+| Playbooks | `PLAYBOOK_DRY_RUN` (default `true`) |
+
+> Changing `EMBED_MODEL` after first boot invalidates every embedded case. Pick once, keep forever.
+
+---
+
+## Hardware sizing for local LLMs
+
+| RAM | Suggested Ollama model |
+|---|---|
+| 4 GB | `qwen3:1.7b` *(default)* |
+| 8 GB | `mistral:7b`, `llama3.1:8b` |
+| 16 GB | `qwen3:14b`, `mistral-nemo:12b` |
+| 24 GB+ | `qwen3:32b`, quantized `llama3.1:70b` |
+
+Switch via `OLLAMA_MODEL` after `ollama pull`.
+
+---
+
+## Example alert payload
 
 ```json
 {
   "sourceRef": "CASE-001",
-  "title": "Suspicious outbound connection to known C2",
-  "description": "EDR detected process making repeated connections to flagged external IP.",
+  "title": "Outbound C2 beacon",
+  "description": "EDR detected periodic connections to flagged IP.",
   "source": "Endpoint Detection and Response (EDR)",
   "severity": "high",
   "attack_type": "malware",
@@ -250,46 +208,45 @@ Returns `confidence_before` and `confidence_after` so the UI can update in real 
 }
 ```
 
-## Simulation & Testing
+Connector-specific raw payloads (Wazuh, Elastic, Splunk, QRadar) are normalized before reaching this shape — see `connectors/*.py` for each format.
 
-Run the built-in simulation harness to validate the full pipeline against 12 pre-defined scenarios (APT chains, ransomware, false positives):
+---
+
+## Security baseline
+
+- JWT with refresh-token rotation; Redis blocklist for revoked JTIs (`nexussoc:revoked:{jti}`)
+- Sliding-window rate limiter per IP and per path
+- 1 MB request size cap; OWASP security headers; opt-in HSTS
+- SSRF guard on every outbound webhook (RFC1918, link-local, IPv6 ULA)
+- Pydantic v2 with `extra="forbid"` on every input model
+- Hard-coded plugin registry — no dynamic import paths
+- No `eval`, `exec`, `pickle`, `yaml.load`, or `shell=True`
+- Audit log middleware persists every state-changing call
+- Non-root container (`appuser`, uid 1001), backend / frontend network isolation
+- Worker uses an `X-API-Key` header instead of full login flow
+- Playbook actions default to `DRY_RUN` — real webhooks require `PLAYBOOK_DRY_RUN=false`
+
+---
+
+## Run locally (without Docker)
 
 ```bash
-python advanced_soc_simulation.py
+cp .env.example .env
+pip install -r requirements.txt
+alembic upgrade head
+uvicorn main:app --host 0.0.0.0 --port 8001
 ```
 
-Results are saved to `sim_results.json` (gitignored — generated output only).
+Worker (separate process):
 
-## Alert Sources Supported
-
-- Suricata IDS
-- Splunk DLP
-- Endpoint Detection and Response (EDR)
-- NetFlow Analysis
-- Windows Event Logs + Sigma Rules
-- SIEM
-- Web Application Firewall
-
-## Project Structure
-
+```bash
+python worker.py
 ```
-SocAnalyst_Ai_Agent/
-├── docker-compose.yml         # Full stack: API + worker + DB + Redis + Grafana + frontend
-├── .env                       # Your environment variables (gitignored)
-├── ai_agent_src/              # This repo — AI agent backend
-│   ├── main.py                # FastAPI app — endpoints, LLM analysis, skill learning
-│   ├── correlator.py          # Alert → incident correlation logic
-│   ├── playbooks.py           # Playbook execution engine
-│   ├── seed_playbooks.py      # Seeds 8 default response playbooks
-│   ├── worker.py              # Redis queue worker
-│   ├── advanced_soc_simulation.py  # End-to-end simulation harness
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── .env.example
-├── grafana/                   # Grafana dashboard config
-└── soc-frontend/              # SOC dashboard frontend
-```
+
+For the full stack (Postgres + Redis + Grafana + Ollama + frontend), use `docker compose up --build` from the repo root.
+
+---
 
 ## License
 
-MIT
+MIT — see root `LICENSE`.

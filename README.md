@@ -260,6 +260,7 @@ All configuration is environment-driven. See `ai_agent_src/.env.example` for the
 | **Auth** | `AUTH_ENABLED`, `JWT_SECRET`, `ACCESS_TOKEN_EXPIRE_MINUTES`, `REFRESH_TOKEN_EXPIRE_DAYS`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `API_KEY` |
 | **CORS / HTTPS** | `CORS_ORIGINS`, `HTTPS_ONLY` |
 | **Plugins** | `PLUGIN_DISCORD_ENABLED`, `PLUGIN_SLACK_ENABLED`, `PLUGIN_TEAMS_ENABLED`, `PLUGIN_VT_ENABLED`, `PLUGIN_ABUSEIPDB_ENABLED`, `PLUGIN_MITRE_EXPORT_ENABLED`, `PLUGIN_STIX2_ENABLED` and their `*_WEBHOOK` / `*_API_KEY` companions |
+| **Batch ingest** | `BATCH_MAX_ALERTS` (default `100`) — max alerts per `POST /ingest/batch` |
 | **Playbooks** | `PLAYBOOK_DRY_RUN` |
 
 > ⚠️ Changing `EMBED_MODEL` after first boot invalidates every embedded case in pgvector. Pick once, keep forever.
@@ -278,6 +279,18 @@ curl -X POST http://localhost:8001/ingest/wazuh \
 ```
 
 Available connectors: `wazuh`, `elastic`, `splunk`, `qradar`, `generic`. List them with `GET /connectors`.
+
+### Batch ingest
+```bash
+curl -X POST http://localhost:8001/ingest/batch \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"connector_name":"wazuh","alerts":[{...},{...}]}'
+# 202 → { "results":[...], "total":N, "succeeded":S, "failed":F }
+# 413 if N > BATCH_MAX_ALERTS (default 100). Omit connector_name to auto-detect per alert.
+```
+
+The frontend exposes the same endpoint via the **Analyze** tab — paste raw JSON or upload a `.json` file containing one alert or an array.
 
 ### Synchronous analysis
 ```bash
@@ -379,9 +392,9 @@ If you discover a security issue, please open a private advisory on GitHub rathe
 - [x] Phase 2.3 — Multi-SIEM connectors (Wazuh / Elastic / Splunk / QRadar / generic)
 - [x] Phase 3 — Observability (Prometheus + Grafana), Alembic migrations, worker DLQ, expanded `/health`
 - [x] Phase 4 — Open-source packaging (Makefile, GitHub Actions CI + release)
-- [x] Phase 5 — UX (theme toggle, STIX export, admin panels)
+- [x] Phase 5 — UX (theme toggle, STIX 2.1 export, admin panels, DLQ inspector)
+- [x] Batch ingest — `POST /ingest/batch` + Analyze panel (paste / upload JSON, optional connector auto-detect, capped by `BATCH_MAX_ALERTS`)
 - [ ] Phase 6 — Documentation site (`mkdocs-material`) + plugin authoring guide
-- [ ] First-class STIX 2.1 export (currently a stub)
 - [ ] Optional vector store providers beyond pgvector
 
 ---
