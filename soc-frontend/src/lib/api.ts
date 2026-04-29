@@ -176,6 +176,24 @@ export const api = {
   getConnectors: () =>
     request<{ connectors: string[] }>('/connectors'),
 
+  ingestBatch: (data: { connector_name?: string; alerts: Record<string, unknown>[] }) =>
+    request<{
+      results: Array<{
+        index:     number
+        success:   boolean
+        job_id?:    string
+        case_id?:   string
+        connector?: string
+        error?:     string
+      }>
+      total: number
+      succeeded: number
+      failed: number
+    }>('/ingest/batch', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
   getDlq: (limit = 50) =>
     request<{
       total: number

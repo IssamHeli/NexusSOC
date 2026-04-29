@@ -11,6 +11,7 @@ import { UsersPanel } from './components/UsersPanel'
 import { PluginsPanel } from './components/PluginsPanel'
 import { DlqPanel } from './components/DlqPanel'
 import { ConnectorsPanel } from './components/ConnectorsPanel'
+import { AnalyzeForm } from './components/AnalyzeForm'
 import { LoginPage } from './components/LoginPage'
 import { AuthProvider, useAuth, AUTH_ENABLED } from './contexts/AuthContext'
 import { setUnauthorizedHandler } from './lib/api'
@@ -26,6 +27,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: 'plugins',    label: '⬡ Plugins' },
   { id: 'connectors', label: '⇄ Connectors' },
   { id: 'dlq',        label: '☒ DLQ' },
+  { id: 'analyze',  label: '⌕ Analyze' },
   { id: 'audit',      label: '⊛ Audit' },
   { id: 'users',      label: '◉ Users' },
 ]
@@ -107,6 +109,7 @@ function AppShell() {
         {tab === 'plugins'     && <PluginsPanel />}
         {tab === 'connectors'  && <ConnectorsPanel />}
         {tab === 'dlq'         && <DlqPanel />}
+        {tab === 'analyze'   && <AnalyzeForm />}
         {tab === 'audit'       && <AuditPanel />}
         {tab === 'users'       && <UsersPanel />}
       </main>

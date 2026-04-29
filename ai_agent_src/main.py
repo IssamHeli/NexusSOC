@@ -274,6 +274,27 @@ class FeedbackRequest(BaseModel):
     correct:      bool
     analyst_note: Optional[str] = None
 
+BATCH_MAX_ALERTS = int(os.getenv("BATCH_MAX_ALERTS", "100"))
+
+
+class BatchIngestRequest(BaseModel):
+    connector_name: Optional[str] = None
+    alerts: List[dict]
+
+class BatchIngestResultItem(BaseModel):
+    index:     int
+    success:   bool
+    job_id:    Optional[str] = None
+    case_id:   Optional[str] = None
+    connector: Optional[str] = None
+    error:     Optional[str] = None
+
+class BatchIngestResponse(BaseModel):
+    results:   List[BatchIngestResultItem]
+    total:     int
+    succeeded: int
+    failed:    int
+
 # ── EMBEDDING ─────────────────────────────────────────────────────────────────
 
 async def get_embedding(text: str) -> Optional[List[float]]:
@@ -1167,6 +1188,114 @@ async def list_connectors(_user: dict = Depends(require_role("viewer"))):
     return {"connectors": list(CONNECTOR_REGISTRY.keys())}
 
 
+@app.post("/ingest/batch", status_code=202)
+async def ingest_batch(
+    body: BatchIngestRequest,
+    request: Request,
+    _user: dict = Depends(require_role("analyst")),
+):
+    """Normalize and enqueue a batch of raw SIEM alerts.
+
+    connector_name is optional. If omitted, each alert is tested against all
+    connectors (auto-detect). First connector whose normalize() succeeds wins.
+    Failed individual alerts do NOT block valid ones.
+    """
+    rc = request.app.state.redis
+    if not rc:
+        raise HTTPException(status_code=503, detail="Queue unavailable — REDIS_URL not configured")
+
+    if not body.alerts:
+        raise HTTPException(status_code=422, detail="alerts must not be empty")
+    if len(body.alerts) > BATCH_MAX_ALERTS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Batch too large: {len(body.alerts)} alerts (max {BATCH_MAX_ALERTS})",
+        )
+
+    results: List[BatchIngestResultItem] = []
+    succeeded = 0
+
+    for idx, raw in enumerate(body.alerts):
+        connector_name = body.connector_name
+        connector = None
+        chosen_connector: Optional[str] = None
+
+        if connector_name:
+            connector = CONNECTOR_REGISTRY.get(connector_name)
+            if not connector:
+                results.append(BatchIngestResultItem(
+                    index=idx, success=False,
+                    error=f"Unknown connector '{connector_name}'"
+                ))
+                continue
+        else:
+            for name, c in CONNECTOR_REGISTRY.items():
+                try:
+                    c.normalize(raw)
+                    connector = c
+                    chosen_connector = name
+                    break
+                except (ValueError, KeyError):
+                    continue
+
+        if not connector:
+            results.append(BatchIngestResultItem(
+                index=idx, success=False,
+                error="No connector could normalize this alert"
+            ))
+            continue
+
+        actual_connector = connector_name or chosen_connector or "unknown"
+
+        try:
+            normalized = connector.normalize(raw)
+        except (ValueError, KeyError) as exc:
+            results.append(BatchIngestResultItem(
+                index=idx, success=False,
+                error=f"Normalization error: {exc}"
+            ))
+            continue
+
+        try:
+            alert = SecurityAlert.model_validate(normalized)
+        except Exception as exc:
+            results.append(BatchIngestResultItem(
+                index=idx, success=False,
+                error=f"Schema validation error: {exc}"
+            ))
+            continue
+
+        job_id = str(uuid.uuid4())
+        payload = json.loads(alert.model_dump_json())
+        payload["_job_id"]     = job_id
+        payload["_connector"]  = actual_connector
+        payload["timestamp"]   = payload.get("timestamp") or datetime.now(timezone.utc).isoformat()
+
+        await rc.hset(f"{JOB_PREFIX}{job_id}", mapping={
+            "status":     "queued",
+            "case_id":    alert.sourceRef,
+            "connector":  actual_connector,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        await rc.expire(f"{JOB_PREFIX}{job_id}", JOB_TTL)
+        await rc.lpush(QUEUE_KEY, json.dumps(payload, default=str))
+
+        logger.info("Batch ingest job=%s connector=%s case=%s", job_id, actual_connector, alert.sourceRef)
+        results.append(BatchIngestResultItem(
+            index=idx, success=True,
+            job_id=job_id, case_id=alert.sourceRef, connector=actual_connector
+        ))
+        succeeded += 1
+
+    total = len(body.alerts)
+    return BatchIngestResponse(
+        results=results,
+        total=total,
+        succeeded=succeeded,
+        failed=total - succeeded,
+    )
+
+
 @app.post("/ingest/{connector_name}", status_code=202)
 async def ingest_via_connector(
     connector_name: str,
@@ -1222,6 +1351,7 @@ async def ingest_via_connector(
         "connector": connector_name,
         "status":    "queued",
     }
+
 
 
 @app.get("/")

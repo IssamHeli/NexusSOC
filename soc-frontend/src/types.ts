@@ -181,4 +181,4 @@ export interface PluginStatus {
   reason:   string
 }
 
-export type TabId = 'dashboard' | 'skills' | 'memory' | 'simulation' | 'incidents' | 'playbooks' | 'audit' | 'users' | 'plugins' | 'connectors' | 'dlq'
+export type TabId = 'dashboard' | 'skills' | 'memory' | 'simulation' | 'incidents' | 'playbooks' | 'audit' | 'users' | 'plugins' | 'connectors' | 'dlq' | 'analyze'
