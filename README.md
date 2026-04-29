@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="soc-frontend/public/logo.svg" alt="NexusSOC" height="72"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="soc-frontend/public/logo-dark.svg"/>
+  <img src="soc-frontend/public/logo-light.svg" alt="NexusSOC" height="72"/>
+</picture>
 
 **AI-powered Security Operations Center analyst — local-first, plugin-driven, production-ready.**
 
