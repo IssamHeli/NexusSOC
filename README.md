@@ -57,6 +57,14 @@ Most "AI SOC" tools are cloud-only black boxes. NexusSOC is built for analysts w
     <td align="center"><img src="soc-frontend/Images/Memory.jpg" alt="Memory"/><br/><sub><b>Memory</b> — analyzed cases with confidence and feedback</sub></td>
     <td align="center"><img src="soc-frontend/Images/Skills.jpg" alt="Skills"/><br/><sub><b>Skills</b> — learned detection patterns and confidence trends</sub></td>
   </tr>
+  <tr>
+    <td align="center"><img src="soc-frontend/Images/Analyze.jpg" alt="Analyze"/><br/><sub><b>Analyze</b> — submit one alert or a batch (paste / upload JSON)</sub></td>
+    <td align="center"><img src="soc-frontend/Images/Connectors.jpg" alt="Connectors"/><br/><sub><b>Connectors</b> — loaded SIEM connectors (Wazuh / Elastic / Splunk / QRadar / generic)</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="soc-frontend/Images/Plugins.jpg" alt="Plugins"/><br/><sub><b>Plugins</b> — enrichment / notification / export plugin status</sub></td>
+    <td align="center"><img src="soc-frontend/Images/Users.jpg" alt="Users"/><br/><sub><b>Users</b> — RBAC user management (admin only)</sub></td>
+  </tr>
 </table>
 
 <table>
